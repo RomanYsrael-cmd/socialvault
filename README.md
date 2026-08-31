@@ -1,5 +1,7 @@
 # SocialVault
 
+> **Development status:** Milestone 1 foundation is complete. SocialVault can locally inspect a Facebook Download Your Information ZIP and show an archive-structure overview. It does not yet parse or reconstruct archive content.
+
 **Browse your social media history without giving your social media history to someone else.**
 
 SocialVault is a local-first social archive browser that transforms your downloaded Facebook data archive into a familiar, searchable social media experience.
@@ -18,7 +20,22 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Facebook Archive Support
+### Current milestone
+
+- Polished ZIP picker with drag and drop, validation, file details, and clear action
+- Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
+- Extensible archive detector with Facebook structure/category recognition
+- Guardrails for malformed ZIPs, traversal paths, entry counts, and very large entries
+- Archive overview with file metadata, inspected count, detected categories, and warnings
+- Responsive archive browser shell and future section routes
+- Framework-neutral normalized model types for people, profiles, posts, comments, reactions, conversations, messages, media, and albums
+- Synthetic-only Vitest and Playwright coverage
+
+### Not implemented yet
+
+Profile/timeline browsing, Messenger reconstruction, photo browsing, archive search, SQLite/FTS5 persistence, OPFS storage, full JSON normalization, and media extraction are planned but do **not** work in this milestone.
+
+### Planned Facebook archive support
 
 Planned and supported functionality includes:
 
@@ -52,8 +69,9 @@ Instead:
 2. Open SocialVault.
 3. Select or drag your Facebook ZIP archive into the application.
 4. SocialVault validates and processes the archive locally.
-5. The archive is indexed into a local database.
-6. Browse your history through SocialVault's social-network-style interface.
+5. In this milestone, SocialVault reports the detected archive structure.
+
+Database indexing and full archive browsing are future milestones.
 
 ```text
 Facebook ZIP
@@ -127,7 +145,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-SocialVault does not repeatedly scan the complete Facebook export whenever you search or navigate.
+The planned persistence layer will avoid repeatedly scanning the complete Facebook export whenever you search or navigate. SQLite is not yet connected in the current milestone.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 

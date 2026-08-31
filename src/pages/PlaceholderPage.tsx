@@ -1,0 +1,1 @@
+import {Construction} from 'lucide-react'; export function PlaceholderPage({title}:{title:string}){return <div className="page placeholder"><Construction/><p className="eyebrow">Next milestone</p><h1>{title[0].toUpperCase()+title.slice(1)}</h1><p>This archive view is not implemented yet. The foundation is ready for normalized, local data.</p></div>}

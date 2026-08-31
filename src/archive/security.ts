@@ -1,0 +1,4 @@
+const MAX_ENTRIES=100_000,MAX_ENTRY_SIZE=2*1024*1024*1024;
+export function isSuspiciousPath(path:string){const normalized=path.replaceAll('\\','/');return normalized.startsWith('/')||/^[a-zA-Z]:\//.test(normalized)||normalized.split('/').some(p=>p==='..'||p.includes('\0'))}
+export function validateEntries(entries:{filename:string;uncompressedSize?:number}[]){const warnings:string[]=[];if(entries.length>MAX_ENTRIES) throw new Error('Archive contains too many entries.');for(const e of entries){if(isSuspiciousPath(e.filename)) throw new Error(`Unsafe archive path: ${e.filename}`);if((e.uncompressedSize??0)>MAX_ENTRY_SIZE) warnings.push(`Very large entry was not opened: ${e.filename}`)}return warnings}
+export function safeExternalUrl(value:string){try{const u=new URL(value);return ['https:','http:'].includes(u.protocol)?u.toString():undefined}catch{return undefined}}
