@@ -1,3 +1,3 @@
 import {create} from 'zustand'; import type {DetectionResult} from '../archive/detectors/types';
-type State={fileName?:string;fileSize?:number;result?:DetectionResult;setArchive:(f:File,r:DetectionResult)=>void;clear:()=>void};
-export const useArchiveStore=create<State>(set=>({setArchive:(f,r)=>set({fileName:f.name,fileSize:f.size,result:r}),clear:()=>set({fileName:undefined,fileSize:undefined,result:undefined})}));
+type State={file?:File;fileName?:string;fileSize?:number;result?:DetectionResult;imported:boolean;storageMode?:'opfs'|'indexeddb';setArchive:(f:File,r:DetectionResult)=>void;markImported:(mode:'opfs'|'indexeddb')=>void;clear:()=>void};
+export const useArchiveStore=create<State>(set=>({imported:false,setArchive:(f,r)=>set({file:f,fileName:f.name,fileSize:f.size,result:r,imported:false}),markImported:storageMode=>set({imported:true,storageMode}),clear:()=>set({file:undefined,fileName:undefined,fileSize:undefined,result:undefined,imported:false,storageMode:undefined})}));

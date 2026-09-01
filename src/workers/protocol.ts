@@ -1,2 +1,3 @@
-import type {DetectionResult} from '../archive/detectors/types';
-export type ImportProgress={type:'progress';stage:'opening'|'inspecting'|'detected';message:string}|{type:'result';result:DetectionResult}|{type:'error';message:string};
+import type {DetectionResult} from '../archive/detectors/types'; import type {NormalizedArchiveData} from '../archive/schemas/models';
+export type ImportRequest={action:'inspect'|'import';file:File};
+export type ImportProgress={type:'progress';stage:'opening'|'inspecting'|'detected'|'profile'|'posts'|'messages'|'complete';message:string;completed?:number;total?:number}|{type:'result';result:DetectionResult}|{type:'import-result';data:NormalizedArchiveData}|{type:'error';message:string};

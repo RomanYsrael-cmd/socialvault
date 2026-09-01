@@ -1,0 +1,2 @@
+import{useEffect,useState}from'react';
+export function useDatabaseQuery<T>(load:()=>Promise<T>,deps:unknown[]=[]){const[data,setData]=useState<T>(),[error,setError]=useState(''),[loading,setLoading]=useState(true);useEffect(()=>{let active=true;setLoading(true);load().then(x=>active&&setData(x)).catch(e=>active&&setError(e instanceof Error?e.message:String(e))).finally(()=>active&&setLoading(false));return()=>{active=false}},deps);return{data,error,loading}}

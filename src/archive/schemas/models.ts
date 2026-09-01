@@ -1,1 +1,13 @@
-export type ID=string; export interface Archive{id:ID;platform:string;createdAt?:string} export interface Person{id:ID;displayName:string;profileUrl?:string} export interface Profile{id:ID;personId:ID;bio?:string} export interface Post{id:ID;authorId?:ID;text?:string;createdAt?:string} export interface Comment{id:ID;postId:ID;authorId?:ID;text:string} export interface Reaction{id:ID;targetId:ID;personId?:ID;kind:string} export interface Conversation{id:ID;title?:string;participantIds:ID[]} export interface Message{id:ID;conversationId:ID;senderId?:ID;text?:string;sentAt?:string} export interface Media{id:ID;path:string;mimeType?:string;caption?:string} export interface Album{id:ID;title:string;mediaIds:ID[]}
+export type ID=string;
+export interface SourceRef{platform:'facebook';path:string;index?:number}
+export interface Archive{id:ID;platform:string;createdAt?:string}
+export interface Person{id:ID;displayName:string;profileUrl?:string}
+export interface Profile{id:ID;personId:ID;displayName:string;username?:string;bio?:string;joinedAt?:string;source:SourceRef}
+export interface Post{id:ID;authorId?:ID;text?:string;title?:string;createdAt?:string;source:SourceRef}
+export interface Comment{id:ID;postId:ID;authorId?:ID;text:string}
+export interface Reaction{id:ID;targetId:ID;personId?:ID;kind:string}
+export interface Conversation{id:ID;title?:string;participantIds:ID[];participantNames:string[];source:SourceRef}
+export interface Message{id:ID;conversationId:ID;senderId?:ID;senderName?:string;text?:string;sentAt?:string;source:SourceRef}
+export interface Media{id:ID;path:string;mimeType?:string;caption?:string}
+export interface Album{id:ID;title:string;mediaIds:ID[]}
+export interface NormalizedArchiveData{profile?:Profile;posts:Post[];conversations:Conversation[];messages:Message[];warnings:string[]}

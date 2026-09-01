@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 1 foundation is complete. SocialVault can locally inspect a Facebook Download Your Information ZIP and show an archive-structure overview. It does not yet parse or reconstruct archive content.
+> **Development status:** Milestone 2 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, locally parse a supported subset of profile, post, and Messenger JSON, normalize it, persist it in browser storage, and show basic read-only archive views.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,20 +20,33 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Current milestone
+### Milestone 2 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
 - Extensible archive detector with Facebook structure/category recognition
 - Guardrails for malformed ZIPs, traversal paths, entry counts, and very large entries
-- Archive overview with file metadata, inspected count, detected categories, and warnings
-- Responsive archive browser shell and future section routes
-- Framework-neutral normalized model types for people, profiles, posts, comments, reactions, conversations, messages, media, and albums
+- Incremental, tolerant Facebook adapter for common profile, posts, and Messenger paths
+- Source-file references retained on normalized profile, post, conversation, and message records
+- Section-level import progress and non-fatal malformed/unsupported JSON warnings
+- SQLite WebAssembly storage in a dedicated worker with schema migrations and indexed queries
+- Persistent OPFS database where supported; durable IndexedDB snapshot plus an in-memory SQLite query layer as fallback
+- Read-only Profile, Posts, Conversations, and individual Conversation views
+- Archive overview with local import controls, summary, storage mode, and warnings
+- Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
 ### Not implemented yet
 
-Profile/timeline browsing, Messenger reconstruction, photo browsing, archive search, SQLite/FTS5 persistence, OPFS storage, full JSON normalization, and media extraction are planned but do **not** work in this milestone.
+Photos and media extraction, comments/reactions, friend browsing, archive search/FTS5, complete Facebook format coverage, pagination/virtualization, and a polished timeline or Messenger reconstruction are not implemented. The current text views are intentionally basic.
+
+### Supported path assumptions
+
+The adapter currently recognizes profile files containing `profile_information` or `profile_v2`; post files below a `posts` directory or named `your_posts*.json`; and Messenger thread files matching `messages/inbox/*/message_*.json` or `messages/archived_threads/*/message_*.json`. Facebook changes its export format over time, so unrecognized files are skipped and malformed candidate JSON is reported as a warning.
+
+### Browser storage
+
+On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Both stores are origin-private and device-local; clearing site data removes them.
 
 ### Planned Facebook archive support
 
@@ -69,9 +82,8 @@ Instead:
 2. Open SocialVault.
 3. Select or drag your Facebook ZIP archive into the application.
 4. SocialVault validates and processes the archive locally.
-5. In this milestone, SocialVault reports the detected archive structure.
-
-Database indexing and full archive browsing are future milestones.
+5. Choose **Start local import** to parse supported JSON in a worker.
+6. Browse the basic normalized Profile, Posts, and Messages views.
 
 ```text
 Facebook ZIP
@@ -145,7 +157,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The planned persistence layer will avoid repeatedly scanning the complete Facebook export whenever you search or navigate. SQLite is not yet connected in the current milestone.
+The current persistence layer stores normalized profile, post, conversation, and message records in SQLite WASM. A versioned migration table provides the foundation for later schema evolution. Full-text search is not connected yet.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 

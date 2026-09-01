@@ -1,0 +1,4 @@
+import type{NormalizedArchiveData}from'../archive/schemas/models';
+const DB='socialvault-fallback',STORE='archives',KEY='current';
+export function putFallback(data:NormalizedArchiveData){return new Promise<void>((resolve,reject)=>{const req=indexedDB.open(DB,1);req.onupgradeneeded=()=>req.result.createObjectStore(STORE);req.onerror=()=>reject(req.error);req.onsuccess=()=>{const tx=req.result.transaction(STORE,'readwrite');tx.objectStore(STORE).put(data,KEY);tx.oncomplete=()=>{req.result.close();resolve()};tx.onerror=()=>reject(tx.error)}})}
+export function getFallback(){return new Promise<NormalizedArchiveData|undefined>((resolve,reject)=>{const req=indexedDB.open(DB,1);req.onupgradeneeded=()=>req.result.createObjectStore(STORE);req.onerror=()=>reject(req.error);req.onsuccess=()=>{const tx=req.result.transaction(STORE,'readonly'),get=tx.objectStore(STORE).get(KEY);get.onsuccess=()=>{req.result.close();resolve(get.result)};get.onerror=()=>reject(get.error)}})}
