@@ -42,6 +42,7 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Paginated People repository with SQL-derived message, post, media, and conversation participation counts
 - Read-only archive person pages with related posts, interaction counts, and safe exact-profile/search links to Facebook when evidence exists
 - Section-level import progress and non-fatal malformed/unsupported JSON warnings
+- Facebook HTML-only exports are identified during inspection and stopped with an actionable format message; they never create a misleading empty completed index
 - SQLite WebAssembly storage in a dedicated worker with schema migrations and indexed queries
 - Persistent OPFS database where supported; durable IndexedDB snapshot plus an in-memory SQLite query layer as fallback
 - Read-only Profile/About, Posts/comments, Friends, Albums, Conversations, and individual Conversation views
@@ -90,11 +91,11 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 
 ### Not implemented yet
 
-Complete Facebook format coverage, automatic media extraction, bulk thumbnail generation, FTS5 search across every future section, comments/reaction editing, archive merging, incremental newer-export synchronization, and multi-archive management are not implemented. The current views remain intentionally lightweight and read-only.
+Complete Facebook format coverage (including the HTML export format), automatic media extraction, bulk thumbnail generation, FTS5 search across every future section, comments/reaction editing, archive merging, incremental newer-export synchronization, and multi-archive management are not implemented. The current views remain intentionally lightweight and read-only.
 
 ### Supported path assumptions
 
-The adapter currently recognizes profile files containing `profile_information`, `profile_v2`, `personal_information`, account/profile directories, or a profile JSON basename; post files below a `posts` directory or named `your_posts.json`, `your_posts__1.json`, or `your_posts_1.json`; comments/reactions files containing `comments`, `reactions`, `likes`, or nested interaction arrays; connection files containing `friends`, `followers`, `following`, `friend_requests`, or `connections`; album files containing `albums`; and Messenger thread files under `messages/inbox`, `messages/archived_threads`, `messages/filtered_messages`, `messages/message_requests`, or marketplace-like message directories with `message_*.json`, `message-*.json`, or chunked names. It accepts common casing and field variants for names, IDs, timestamps, content, participants, relationship status, About facts, album media, and attachment references. Facebook changes its export format over time, so unrecognized files and unsupported shapes are skipped with aggregated structural diagnostics, malformed candidate JSON is reported as a warning, and coverage is shown in the archive overview.
+The adapter currently recognizes profile files containing `profile_information`, `profile_v2`, `personal_information`, account/profile directories, or a profile JSON basename; post files below a `posts` directory or named `your_posts.json`, `your_posts__1.json`, or `your_posts_1.json`; comments/reactions files containing `comments`, `reactions`, `likes`, or nested interaction arrays; connection files containing `friends`, `followers`, `following`, `friend_requests`, or `connections`; album files containing `albums`; and Messenger thread files under `messages/inbox`, `messages/archived_threads`, `messages/filtered_messages`, `messages/message_requests`, or marketplace-like message directories with `message_*.json`, `message-*.json`, or chunked names. It accepts common casing and field variants for names, IDs, timestamps, content, participants, relationship status, About facts, album media, and attachment references. The current parser consumes JSON files only. Facebook's HTML export paths are recognized as Facebook structure evidence, but an HTML-only set is reported as unsupported before import so it cannot be mistaken for an empty normalized archive. Facebook changes its export format over time, so unrecognized files and unsupported shapes are skipped with aggregated structural diagnostics, malformed candidate JSON is reported as a warning, and coverage is shown in the archive overview.
 
 ### Browser storage
 

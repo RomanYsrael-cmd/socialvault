@@ -18,6 +18,8 @@ export const facebookSectionForPath=(filename:string)=>{
 export const facebookDetector:ArchiveDetector={platform:'facebook',detect(entries:ArchiveEntryInfo[]):DetectionResult{
   const paths=entries.map(e=>e.filename.toLowerCase().replaceAll('\\','/'));
   const jsonCount=paths.filter(p=>p.endsWith('.json')).length;
+  const htmlCount=paths.filter(p=>p.endsWith('.html')).length;
+  const format=jsonCount>0&&htmlCount>0?'mixed':jsonCount>0?'json':htmlCount>0?'html':'unknown';
   const found=markers.filter(marker=>paths.some(path=>path.includes(marker.needle)));
   const sections=[...new Set(found.map(marker=>marker.section))];
   const supportedSections=[...new Set(found.filter(marker=>marker.supported).map(marker=>marker.section))];
@@ -27,6 +29,9 @@ export const facebookDetector:ArchiveDetector={platform:'facebook',detect(entrie
   const supported=jsonCount>0&&(identity||structure||sections.length>0);
   const warnings:string[]=[];
   if(supported&&supportedSections.length<2)warnings.push('Only a limited set of recognizable Facebook sections was found.');
+  if(format==='html'&&sections.length)warnings.push('Facebook HTML export detected. SocialVault currently imports Facebook JSON exports; HTML files were not imported.');
+  if(format==='mixed')warnings.push('This archive contains both JSON and HTML Facebook export files. Only supported JSON files are imported.');
   if(unsupportedSections.length)warnings.push(`Detected unsupported Facebook sections: ${unsupportedSections.join(', ')}.`);
-  return {supported,platform:supported?'facebook':'unknown',confidence:supported?Math.min(.98,.55+sections.length*.06):.05,entryCount:entries.length,inspectedEntries:entries.length,sections,supportedSections,unsupportedSections,warnings};
+  const confidence=supported?Math.min(.98,.55+sections.length*.06):((format==='html'&&sections.length>0) ? .2 : .05);
+  return {supported,platform:supported?'facebook':'unknown',confidence,entryCount:entries.length,inspectedEntries:entries.length,sections,supportedSections,unsupportedSections,warnings,format};
 }};

@@ -67,8 +67,15 @@ function aggregateDetection(inspected: InspectedPart[], duplicateNames: string[]
   const sections = [...new Set(unique.flatMap(item => item.detection.sections))];
   const supportedSections = [...new Set(unique.flatMap(item => item.detection.supportedSections ?? []))];
   const unsupportedSections = [...new Set(unique.flatMap(item => item.detection.unsupportedSections ?? []))];
-  const supportedEvidence = unique.some(item => item.detection.supported || item.detection.sections.length > 0);
-  const unsupportedParts = unique.filter(item => !item.detection.supported && item.detection.sections.length === 0).map(item => item.file.name);
+  // Section markers alone are not enough to authorize an import.  An HTML
+  // export contains many familiar Facebook directory names, but this
+  // milestone intentionally parses JSON only.  Requiring detector support
+  // prevents an HTML-only archive from being reported as a successful import
+  // with an empty normalized database.
+  const supportedEvidence = unique.some(item => item.detection.supported);
+  const formats = [...new Set(unique.map(item => item.detection.format ?? 'unknown'))];
+  const format = formats.includes('mixed') || (formats.includes('json') && formats.includes('html')) ? 'mixed' : formats.includes('json') ? 'json' : formats.includes('html') ? 'html' : 'unknown';
+  const unsupportedParts = unique.filter(item => !item.detection.supported).map(item => item.file.name);
   const totalEntries = unique.reduce((sum, item) => sum + item.entries.length, 0);
   const totalSize = unique.reduce((sum, item) => sum + item.file.size, 0);
   const fingerprint = archiveSetFingerprint(unique.map(item => item.part));
@@ -77,10 +84,11 @@ function aggregateDetection(inspected: InspectedPart[], duplicateNames: string[]
   const duplicatePaths = [...pathOwners.entries()].filter(([, owners]) => owners.length > 1).map(([path]) => path);
   duplicatePaths.slice(0, 20).forEach(path => warnings.push(`${(pathOwners.get(path) ?? []).join(', ')}: duplicate entry path appears in multiple ZIP parts (${path})`));
   duplicateNames.forEach(name => warnings.push(`${name}: duplicate ZIP part selected; it will be imported once.`));
-  unsupportedParts.forEach(name => warnings.push(`${name}: no recognizable Facebook export sections; skipped.`));
-  const parts = unique.map(item => ({ ...item.part, archiveId: archiveSetId(fingerprint), partIndex: unique.findIndex(other => other.part.manifestFingerprint === item.part.manifestFingerprint), sections: item.detection.sections }));
+  unsupportedParts.forEach(name => warnings.push(`${name}: no supported Facebook JSON content; skipped.`));
+  if (!supportedEvidence && format === 'html' && sections.length) warnings.push('This archive appears to be a Facebook HTML export. Choose JSON format when requesting your information to use the local importer.');
+  const parts = unique.map(item => ({ ...item.part, archiveId: archiveSetId(fingerprint), partIndex: unique.findIndex(other => other.part.manifestFingerprint === item.part.manifestFingerprint), sections: item.detection.sections, status: item.detection.supported ? item.part.status : 'failed' as const }));
   const first = unique[0]?.file;
-  return { supported: supportedEvidence, platform: supportedEvidence ? 'facebook' : 'unknown', confidence: supportedEvidence ? Math.min(.99, .58 + sections.length * .05) : .03, entryCount: totalEntries, inspectedEntries: totalEntries, sections, supportedSections, unsupportedSections, warnings, identity: first ? { filename: unique.length === 1 ? first.name : `${unique.length} Facebook ZIP parts`, size: totalSize, entryCount: totalEntries, fingerprint, knownEntries: unique.flatMap(item => item.entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename))).sort().slice(0, 80) } : undefined, parts, archiveSetFingerprint: fingerprint, totalSize, duplicateParts: duplicateNames, unsupportedParts, duplicatePaths };
+  return { supported: supportedEvidence, platform: supportedEvidence ? 'facebook' : 'unknown', confidence: supportedEvidence ? Math.min(.99, .58 + sections.length * .05) : (format === 'html' && sections.length ? .2 : .03), entryCount: totalEntries, inspectedEntries: totalEntries, sections, supportedSections, unsupportedSections, warnings, identity: first ? { filename: unique.length === 1 ? first.name : `${unique.length} Facebook ZIP parts`, size: totalSize, entryCount: totalEntries, fingerprint, knownEntries: unique.flatMap(item => item.entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename))).sort().slice(0, 80) } : undefined, parts, archiveSetFingerprint: fingerprint, totalSize, duplicateParts: duplicateNames, unsupportedParts, duplicatePaths, format };
 }
 
 async function parsePart(item: InspectedPart, partCount: number): Promise<NormalizedArchiveData> {
@@ -194,7 +202,7 @@ async function run(payload: ImportRunRequest) {
   if (payload.action === 'inspect' || payload.action === 'verify') { send({ type: 'result', result: detection }); return; }
   if (!detection.supported) throw new Error('These ZIP files do not look like a supported Facebook Download Your Information archive.');
   const completed = new Set(payload.completedPartIds ?? []), skipped = new Set(payload.skippedPartIds ?? []);
-  const parseable = inspected.filter(item => item.part.status !== 'failed' && !completed.has(item.part.id) && !skipped.has(item.part.id));
+  const parseable = inspected.filter(item => item.detection.supported && item.part.status !== 'failed' && !completed.has(item.part.id) && !skipped.has(item.part.id));
   const parts = detection.parts ?? [], partByFingerprint = new Map(parts.map(part => [part.manifestFingerprint, part]));
   // Keep only import metadata in this worker after a part is handed to the
   // database worker. Normalized records can be very large; retaining every
