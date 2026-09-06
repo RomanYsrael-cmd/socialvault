@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=6;
+export const SCHEMA_VERSION=7;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -87,6 +87,17 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE INDEX IF NOT EXISTS idx_source_connections_part ON connections(archive_part_id)`,
     `CREATE INDEX IF NOT EXISTS idx_source_albums_part ON albums(archive_part_id)`,
     `CREATE INDEX IF NOT EXISTS idx_source_activity_part ON activity_records(archive_part_id)`
+  ]},
+  {version:7,statements:[
+    `CREATE TABLE IF NOT EXISTS import_sessions (id TEXT PRIMARY KEY, archive_set_id TEXT NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, parser_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, expected_part_count INTEGER NOT NULL DEFAULT 0, inspected_part_count INTEGER NOT NULL DEFAULT 0, imported_part_count INTEGER NOT NULL DEFAULT 0, failed_part_count INTEGER NOT NULL DEFAULT 0, skipped_part_count INTEGER NOT NULL DEFAULT 0, current_stage TEXT NOT NULL DEFAULT 'inspection', status TEXT NOT NULL DEFAULT 'new', normalized_counts TEXT NOT NULL DEFAULT '{}', warnings_count INTEGER NOT NULL DEFAULT 0, failed_part_ids TEXT NOT NULL DEFAULT '[]', skipped_part_ids TEXT NOT NULL DEFAULT '[]', detected_sections TEXT NOT NULL DEFAULT '[]', imported_sections TEXT NOT NULL DEFAULT '[]', coverage TEXT, last_error TEXT, metrics TEXT)` ,
+    `CREATE TABLE IF NOT EXISTS import_part_checkpoints (session_id TEXT NOT NULL, archive_part_id TEXT NOT NULL, part_index INTEGER NOT NULL, manifest_fingerprint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', started_at TEXT, updated_at TEXT NOT NULL, completed_at TEXT, parser_version INTEGER NOT NULL, record_counts TEXT NOT NULL DEFAULT '{}', warnings_count INTEGER NOT NULL DEFAULT 0, error TEXT, sections TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(session_id,archive_part_id), FOREIGN KEY(session_id) REFERENCES import_sessions(id))`,
+    `CREATE INDEX IF NOT EXISTS idx_import_part_checkpoints_session ON import_part_checkpoints(session_id,part_index)`,
+    `CREATE INDEX IF NOT EXISTS idx_import_part_checkpoints_status ON import_part_checkpoints(session_id,status)`,
+    `CREATE TABLE IF NOT EXISTS import_section_status (session_id TEXT NOT NULL, section TEXT NOT NULL, parser_version INTEGER NOT NULL, status TEXT NOT NULL, record_count INTEGER NOT NULL DEFAULT 0, warning_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(session_id,section), FOREIGN KEY(session_id) REFERENCES import_sessions(id))`,
+    `CREATE TABLE IF NOT EXISTS rebuild_jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, rows_processed INTEGER NOT NULL DEFAULT 0, error TEXT)`,
+    `CREATE TABLE IF NOT EXISTS diagnostic_warning_groups (session_id TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 0, source_paths TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(session_id,category,message), FOREIGN KEY(session_id) REFERENCES import_sessions(id))`,
+    `CREATE INDEX IF NOT EXISTS idx_import_sessions_status ON import_sessions(status,updated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_import_sections_session ON import_section_status(session_id,status)`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

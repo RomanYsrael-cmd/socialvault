@@ -37,7 +37,7 @@ export function matchArchiveParts(expected: ArchivePart[], candidates: ArchivePa
   const matched: PartMatchResult['matched'] = [], missing: ArchivePart[] = [], duplicates: ArchivePart[] = [], unexpected: ArchivePart[] = [];
   const used = new Set<string>();
   for (const part of expected) {
-    const sameFingerprint = candidates.filter(candidate => candidate.manifestFingerprint === part.manifestFingerprint);
+    const sameFingerprint = candidates.filter(candidate => candidate.manifestFingerprint === part.manifestFingerprint && candidate.status !== 'missing' && candidate.status !== 'failed' && candidate.status !== 'skipped');
     const candidate = sameFingerprint.find(item => !used.has(item.id));
     if (!candidate) { missing.push({ ...part, connected: false, status: 'missing' }); continue; }
     used.add(candidate.id); matched.push({ expected: part, candidate: { ...candidate, id: part.id, archiveId: part.archiveId, partIndex: part.partIndex, connected: true, status: 'ready' } });
@@ -78,6 +78,10 @@ export function attributeArchivePart(data: NormalizedArchiveData, partId: string
 export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedArchiveData {
   const result: NormalizedArchiveData = { people: [], profileFacts: [], posts: [], comments: [], reactions: [], connections: [], albums: [], conversations: [], messages: [], media: [], warnings: [] };
   const people = new Map<string, Person>();
+  const warningGroups = new Map<string, { category: string; message: string; count: number; sourcePaths: Set<string> }>();
+  const sectionCounts: Record<string, number> = {};
+  const sectionDurations = new Map<string, number>();
+  let totalDurationMs = 0;
   for (const data of parts) {
     if (data.profile && !result.profile) result.profile = data.profile;
     else if (data.profile && result.profile) result.profile = { ...result.profile, ...Object.fromEntries(Object.entries(data.profile).filter(([key, value]) => value && key !== 'source' && !((result.profile as unknown as Record<string, unknown>)[key]))), source: result.profile.source } as typeof result.profile;
@@ -87,13 +91,24 @@ export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedA
     if (data.archiveParts) result.archiveParts = [...(result.archiveParts ?? []), ...data.archiveParts];
     if (data.diagnostics) {
       const current = result.diagnostics ?? { candidateFiles: 0, parsedFiles: 0, unsupportedCandidates: 0, malformedFiles: 0, missingMedia: 0, incompleteIdentities: 0 };
-      result.diagnostics = { candidateFiles: current.candidateFiles + data.diagnostics.candidateFiles, parsedFiles: current.parsedFiles + data.diagnostics.parsedFiles, unsupportedCandidates: current.unsupportedCandidates + data.diagnostics.unsupportedCandidates, malformedFiles: current.malformedFiles + data.diagnostics.malformedFiles, missingMedia: current.missingMedia + data.diagnostics.missingMedia, incompleteIdentities: current.incompleteIdentities + data.diagnostics.incompleteIdentities };
+      result.diagnostics = { candidateFiles: current.candidateFiles + data.diagnostics.candidateFiles, parsedFiles: current.parsedFiles + data.diagnostics.parsedFiles, unsupportedCandidates: current.unsupportedCandidates + data.diagnostics.unsupportedCandidates, malformedFiles: current.malformedFiles + data.diagnostics.malformedFiles, missingMedia: current.missingMedia + data.diagnostics.missingMedia, incompleteIdentities: current.incompleteIdentities + data.diagnostics.incompleteIdentities, shapeSignatures: [...new Set([...(current.shapeSignatures ?? []), ...(data.diagnostics.shapeSignatures ?? [])])].slice(0, 100), detectedSections: [...new Set([...(current.detectedSections ?? []), ...(data.diagnostics.detectedSections ?? [])])], unsupportedSections: [...new Set([...(current.unsupportedSections ?? []), ...(data.diagnostics.unsupportedSections ?? [])])] };
     }
+    for (const group of data.warningGroups ?? data.diagnostics?.warningGroups ?? []) {
+      const existing = warningGroups.get(group.category) ?? { category: group.category, message: group.message, count: 0, sourcePaths: new Set<string>() };
+      existing.count += group.count; group.sourcePaths.forEach(path => existing.sourcePaths.add(path)); warningGroups.set(group.category, existing);
+    }
+    totalDurationMs += data.performance?.totalDurationMs ?? data.diagnostics?.performance?.totalDurationMs ?? 0;
+    for (const [section, count] of Object.entries(data.performance?.sectionCounts ?? {})) sectionCounts[section] = (sectionCounts[section] ?? 0) + count;
+    for (const item of data.performance?.slowestSections ?? []) sectionDurations.set(item.section, (sectionDurations.get(item.section) ?? 0) + item.durationMs);
   }
   result.people = [...people.values()]; result.profileFacts = byId(result.profileFacts); result.posts = byId(result.posts); result.comments = byId(result.comments); result.reactions = byId(result.reactions); result.connections = byId(result.connections); result.albums = byId(result.albums);
   const conversations = new Map<string, typeof result.conversations[number]>();
   for (const conversation of result.conversations) { const existing = conversations.get(conversation.id); if (!existing) conversations.set(conversation.id, { ...conversation, participantIds: [...conversation.participantIds], participantNames: [...conversation.participantNames] }); else { existing.participantIds = [...new Set([...existing.participantIds, ...conversation.participantIds])]; existing.participantNames = [...new Set([...existing.participantNames, ...conversation.participantNames])]; if (!existing.title && conversation.title) existing.title = conversation.title; } }
   result.conversations = [...conversations.values()]; result.messages = byId(result.messages); result.media = byId(result.media); result.warnings = [...new Set(result.warnings)];
   result.archiveParts = byId(result.archiveParts ?? []);
+  result.warningGroups = [...warningGroups.values()].map(group => ({ category: group.category, message: group.message, count: group.count, sourcePaths: [...group.sourcePaths].slice(0, 8) }));
+  if (result.diagnostics) { result.diagnostics.warningGroups = result.warningGroups; result.diagnostics.performance = { totalDurationMs, sectionCounts, slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs })) }; }
+  if (totalDurationMs || Object.keys(sectionCounts).length) result.performance = result.diagnostics?.performance;
+  result.coverage = { detectedSections: [...new Set(parts.flatMap(data => data.coverage?.detectedSections ?? data.importedSections ?? []))], importedSections: [...new Set(parts.flatMap(data => data.coverage?.importedSections ?? data.importedSections ?? []))], partialSections: [...new Set(parts.flatMap(data => data.coverage?.partialSections ?? []))], unsupportedSections: [...new Set(parts.flatMap(data => data.coverage?.unsupportedSections ?? []))], malformedSections: [...new Set(parts.flatMap(data => data.coverage?.malformedSections ?? []))], skippedParts: [...new Set(parts.flatMap(data => data.coverage?.skippedParts ?? []))] };
   return result;
 }

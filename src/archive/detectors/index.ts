@@ -4,6 +4,8 @@ export function detectArchive(entries:ArchiveEntryInfo[]):DetectionResult{const 
 export function detectArchiveSet(parts: ArchiveEntryInfo[][]): DetectionResult {
   const results = parts.map(entries => detectArchive(entries));
   const sections = [...new Set(results.flatMap(result => result.sections))];
+  const supportedSections = [...new Set(results.flatMap(result => result.supportedSections ?? []))];
+  const unsupportedSections = [...new Set(results.flatMap(result => result.unsupportedSections ?? []))];
   const supported = results.some(result => result.supported || result.sections.length > 0);
-  return { supported, platform: supported ? 'facebook' : 'unknown', confidence: supported ? Math.min(.99, .58 + sections.length * .05) : .03, entryCount: results.reduce((sum, result) => sum + result.entryCount, 0), inspectedEntries: results.reduce((sum, result) => sum + result.inspectedEntries, 0), sections, warnings: results.flatMap(result => result.warnings) };
+  return { supported, platform: supported ? 'facebook' : 'unknown', confidence: supported ? Math.min(.99, .58 + sections.length * .05) : .03, entryCount: results.reduce((sum, result) => sum + result.entryCount, 0), inspectedEntries: results.reduce((sum, result) => sum + result.inspectedEntries, 0), sections, supportedSections, unsupportedSections, warnings: results.flatMap(result => result.warnings) };
 }

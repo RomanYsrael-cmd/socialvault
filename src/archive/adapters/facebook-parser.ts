@@ -11,16 +11,30 @@ const numberText = (...values: unknown[]) => {
   const normalized = String(value).trim();
   return /^\d+$/.test(normalized) ? normalized : undefined;
 };
-const date = (value: unknown) => {
+/** Parse timestamps observed in Meta exports without guessing human dates. */
+export const parseFacebookTimestamp = (value: unknown) => {
   if (typeof value !== 'number' && typeof value !== 'string') return undefined;
-  if (typeof value === 'string' && /^\d{4}$/.test(value.trim())) return `${value.trim()}-01-01T00:00:00.000Z`;
-  const parsedNumber = Number(value);
-  const numeric = Number.isFinite(parsedNumber) && parsedNumber < 1e12 ? parsedNumber * 1000 : parsedNumber;
-  const parsed = new Date(Number.isFinite(numeric) ? numeric : value as string);
+  const candidate = typeof value === 'string' ? value.trim() : value;
+  if (candidate === '') return undefined;
+  if (typeof candidate === 'string' && /^\d{4}$/.test(candidate)) return `${candidate}-01-01T00:00:00.000Z`;
+  const parsedNumber = typeof candidate === 'number' ? candidate : /^\d+(?:\.\d+)?$/.test(candidate) ? Number(candidate) : Number.NaN;
+  if (typeof parsedNumber === 'number' && !Number.isFinite(parsedNumber)) {
+    // Only ISO/date-only strings are accepted here; ambiguous human-formatted
+    // dates are intentionally rejected instead of being guessed.
+    if (typeof candidate !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+\-Z]+)?$/.test(candidate)) return undefined;
+  }
+  const numeric = Number.isFinite(parsedNumber) ? (parsedNumber < 1e12 ? parsedNumber * 1000 : parsedNumber) : parsedNumber;
+  const parsed = new Date(Number.isFinite(numeric) ? numeric : candidate as string);
   return Number.isNaN(parsed.valueOf()) ? undefined : parsed.toISOString();
 };
+const date = parseFacebookTimestamp;
 const idPart = (path: string) => path.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-const normalizedPath = (value: string) => value.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\//, '');
+export const normalizeFacebookMediaPath = (value: string) => {
+  let decoded = value;
+  try { decoded = decodeURIComponent(value); } catch { /* keep the original path when it is not valid URI encoding */ }
+  return decoded.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\//, '');
+};
+const normalizedPath = normalizeFacebookMediaPath;
 const mediaType = (path: string, hint?: string): Media['mediaType'] => {
   const value = `${hint ?? ''} ${path}`.toLowerCase();
   if (value.includes('video') || /\.(mp4|mov|webm|m4v)$/.test(value)) return 'video';
@@ -33,6 +47,30 @@ const profileUrl = (...values: unknown[]) => {
   const value = text(...values);
   return value && /^https?:\/\//i.test(value) ? value : undefined;
 };
+
+/** Return a privacy-safe structural signature for diagnostics. Values are never included. */
+export function shapeSignature(value: unknown, depth = 0): string {
+  if (depth > 3) return '…';
+  if (Array.isArray(value)) return `array[${value.length ? shapeSignature(value[0], depth + 1) : 'empty'}]`;
+  if (value === null) return 'null';
+  if (typeof value !== 'object') return typeof value;
+  const object = asRecord(value);
+  // Keys in Facebook's object-keyed exports can themselves be private names
+  // or IDs. Keep only a small vocabulary of structural field names and
+  // redact everything else while preserving the observed shape.
+  const structuralKeys = new Set(['about_me', 'account', 'account_information', 'albums', 'attachments', 'author', 'basic_information', 'body', 'content', 'conversation', 'created_at', 'data', 'display_name', 'entries', 'file_name', 'full_name', 'id', 'items', 'message', 'message_data', 'messages', 'messages_data', 'name', 'participants', 'path', 'personal_information', 'post', 'posts', 'posts_v2', 'profile', 'profile_information', 'profile_v2', 'sender', 'sender_name', 'text', 'thread', 'timestamp', 'title', 'uri', 'user_id', 'username']);
+  return `object{${Object.keys(object).sort().slice(0, 12).map(key => `${structuralKeys.has(key.toLowerCase()) ? key.toLowerCase() : '<key>'}:${shapeSignature(object[key], depth + 1)}`).join(',')}}`;
+}
+
+export function diagnosticWarningCategory(message: string) {
+  const normalized = message.replace(/^.*?·\s*/, '').replace(/\([^)]*\)/g, '(path)').replace(/\d+/g, '#').trim();
+  if (/unsupported|unrecognized/i.test(normalized)) return 'unsupported-shape';
+  if (/malformed|JSON|parse/i.test(normalized)) return 'malformed-json';
+  if (/suspicious|unsafe/i.test(normalized)) return 'unsafe-path';
+  if (/media reference not found/i.test(normalized)) return 'missing-media';
+  if (/duplicate/i.test(normalized)) return 'duplicate-part';
+  return normalized.slice(0, 120) || 'import-warning';
+}
 
 function collectMedia(value: unknown, ownerType: 'post' | 'message' | 'album', ownerId: string, sourcePath: string, sourceIndex: number) {
   const found: Media[] = [];
@@ -82,7 +120,7 @@ export function findUnsafeMediaReferences(value: unknown): string[] {
     const object = asRecord(node);
     for (const key of ['uri', 'path', 'filename', 'file_name', 'fileName', 'local_path', 'localPath']) {
       const candidate = object[key];
-      if (typeof candidate === 'string' && isSuspiciousPath(candidate)) unsafe.add(candidate);
+      if (typeof candidate === 'string' && (isSuspiciousPath(candidate) || isSuspiciousPath(normalizeFacebookMediaPath(candidate)))) unsafe.add(candidate);
     }
     Object.values(object).forEach(child => walk(child, depth + 1));
   };
@@ -92,10 +130,21 @@ export function findUnsafeMediaReferences(value: unknown): string[] {
 
 function profileRoot(raw: unknown) {
   const root = asRecord(raw);
-  const candidates = [root.profile_information, root.profile_v2, root.profile, Array.isArray(raw) ? raw : undefined, root];
-  for (const candidate of candidates) {
-    const value = Array.isArray(candidate) ? asRecord(candidate[0]) : asRecord(candidate);
-    if (Object.keys(value).length) return { root, value };
+  const candidates: unknown[] = [root.profile_information, root.profile_v2, root.personal_information, root.profile, root.account, root.account_information, root.user_profile, root.accounts, Array.isArray(raw) ? raw : undefined, root];
+  const queue = [...candidates];
+  for (let depth = 0; depth < 5 && queue.length; depth++) {
+    const current = queue.splice(0, queue.length);
+    for (const candidate of current) {
+      if (Array.isArray(candidate)) {
+        const first = candidate.find(item => Object.keys(asRecord(item)).length);
+        if (first) queue.push(first);
+        continue;
+      }
+      const value = asRecord(candidate);
+      if (!Object.keys(value).length) continue;
+      if (text(value.name, value.full_name, value.display_name, value.username, value.user_name, value.id, value.user_id)) return { root, value };
+      for (const key of ['profile_information', 'profile_v2', 'personal_information', 'basic_information', 'account_information', 'profile', 'account', 'data', 'user']) if (value[key]) queue.push(value[key]);
+    }
   }
   return { root, value: {} };
 }
@@ -223,15 +272,32 @@ export function parseFacebookReactions(raw: unknown, path: string): { reactions:
   return { reactions, people };
 }
 
-export function parseFacebookPostsWithMedia(raw: unknown, path: string): { posts: Post[]; media: Media[]; comments: Comment[]; reactions: Reaction[]; people: Person[] } {
+function postItems(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw;
   const root = asRecord(raw);
-  const list = Array.isArray(raw) ? raw : Array.isArray(root.posts) ? root.posts : Array.isArray(root.data) ? root.data : [];
+  for (const key of ['posts', 'posts_v2', 'your_posts', 'entries', 'items', 'data']) {
+    const value = root[key];
+    if (Array.isArray(value)) return value;
+    const nested = asRecord(value);
+    for (const nestedKey of ['posts', 'entries', 'items', 'data']) if (Array.isArray(nested[nestedKey])) return nested[nestedKey] as unknown[];
+  }
+  // Some exports wrap one post in an object keyed by an opaque ID. Keep this
+  // bounded and structural rather than scraping arbitrary values.
+  const values = Object.values(root).filter(value => {
+    const object = asRecord(value);
+    return !!text(object.post, object.text, object.message, object.title) || Array.isArray(object.data);
+  });
+  return values.length ? values : [];
+}
+
+export function parseFacebookPostsWithMedia(raw: unknown, path: string): { posts: Post[]; media: Media[]; comments: Comment[]; reactions: Reaction[]; people: Person[] } {
+  const list = postItems(raw);
   const posts: Post[] = [];
   const media: Media[] = [], comments: Comment[] = [], reactions: Reaction[] = [], people: Person[] = [];
   list.forEach((item, index) => {
     const post = asRecord(item);
     const data = Array.isArray(post.data) ? post.data.map(asRecord) : [];
-    const body = text(post.post, post.text, post.content, post.message, ...data.map(entry => entry.post ?? entry.text ?? entry.content));
+    const body = text(post.post, post.text, post.content, post.message, post.story, ...data.map(entry => entry.post ?? entry.text ?? entry.content ?? entry.message));
     const attachments = collectMedia(post, 'post', `post:${idPart(path)}:${index}`, path, index);
     const postId = `post:${idPart(path)}:${index}`;
     const parsedComments = parseComments(post.comments ?? post.comments_v2 ?? post.comment_data ?? post.comment, postId, path, index);
@@ -239,7 +305,8 @@ export function parseFacebookPostsWithMedia(raw: unknown, path: string): { posts
     if (!body && !text(post.title, post.name) && !attachments.length) return;
     const normalized = {
       id: postId,
-      authorId: 'owner',
+      authorId: numberText(post.author_id, post.actor_id, asRecord(post.author).id) ? `person:facebook:${numberText(post.author_id, post.actor_id, asRecord(post.author).id)}` : 'owner',
+      authorName: text(asRecord(post.author).name, asRecord(post.author).display_name, post.author_name),
       text: body,
       title: text(post.title, post.name),
       createdAt: date(post.timestamp ?? post.timestamp_ms ?? post.creation_timestamp ?? post.created_timestamp ?? post.created_time),
@@ -302,10 +369,36 @@ export function parseFacebookAlbumsWithMedia(raw: unknown, path: string): { albu
 
 const participantIdentity = (conversationId: string, name: string, facebookId?: string) => `person:messenger:${idPart(conversationId)}:${idPart(facebookId ?? name)}`;
 
+/** Numeric ordering for message_2.json/message_10.json style chunks. */
+export function compareFacebookChunkPaths(a: string, b: string) {
+  const chunk = (value: string) => Number(value.match(/(?:message|chunk)[_-]?(\d+)/i)?.[1] ?? 0);
+  const numberDiff = chunk(a) - chunk(b);
+  return numberDiff || a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function messageItems(raw: unknown, depth = 0): unknown[] {
+  if (depth > 4) return [];
+  if (Array.isArray(raw)) return raw;
+  const root = asRecord(raw);
+  for (const key of ['messages', 'message', 'messages_data', 'message_data', 'entries', 'items', 'data']) {
+    const candidate = root[key];
+    if (Array.isArray(candidate)) return candidate;
+    const nested = asRecord(candidate);
+    for (const nestedKey of ['messages', 'messages_data', 'entries', 'items', 'data']) if (Array.isArray(nested[nestedKey])) return nested[nestedKey] as unknown[];
+  }
+  for (const key of ['thread', 'conversation', 'thread_data']) {
+    const nested = asRecord(root[key]);
+    const messages = messageItems(nested, depth + 1);
+    if (messages.length) return messages;
+  }
+  return [];
+}
+
 export function parseFacebookConversationWithMedia(raw: unknown, path: string): { conversation?: Conversation; messages: Message[]; media: Media[]; people: Person[] } {
   const root = asRecord(raw);
-  const rawMessages = Array.isArray(root.messages) ? root.messages : Array.isArray(root.message) ? root.message : [];
-  const participantObjects = Array.isArray(root.participants) ? root.participants.map(asRecord) : [];
+  const rawMessages = messageItems(raw);
+  const rawParticipants = root.participants ?? asRecord(root.thread).participants ?? asRecord(root.conversation).participants;
+  const participantObjects = Array.isArray(rawParticipants) ? rawParticipants.map(asRecord) : Object.values(asRecord(rawParticipants)).map(asRecord);
   const participants = participantObjects.map(item => text(item.name, item.display_name, item.full_name)).filter((value): value is string => !!value);
   if (!rawMessages.length && !root.title && !participants.length) return { messages: [], media: [], people: [] };
   const folder = path.replaceAll('\\', '/').split('/').slice(-2, -1)[0] || idPart(path);
@@ -317,7 +410,8 @@ export function parseFacebookConversationWithMedia(raw: unknown, path: string): 
   const people: Person[] = participantObjects.map(item => { const name = text(item.name, item.display_name, item.full_name) ?? 'Unknown participant'; return { id: participantIdentity(conversationId, name, numberText(item.id, item.user_id)), displayName: name, facebookId: numberText(item.id, item.user_id), profileUrl: profileUrl(item.profile_url, item.profileUrl, item.url), identityConfidence: numberText(item.id, item.user_id) ? 'exact' : 'inferred', identitySource: path, sourcePaths: [path] }; });
   rawMessages.forEach((item, index) => {
     const message = asRecord(item);
-    const senderName = text(message.sender_name, message.sender, message.from, asRecord(message.sender_info).name);
+    const senderObject = asRecord(message.sender_info ?? message.sender ?? message.from);
+    const senderName = text(message.sender_name, typeof message.sender === 'string' ? message.sender : undefined, typeof message.from === 'string' ? message.from : undefined, senderObject.name, senderObject.display_name, senderObject.full_name);
     const senderId = participantIdentity(conversationId, senderName ?? 'unknown', numberText(message.sender_id, message.user_id, asRecord(message.sender_info).id));
     const messageMedia = collectMedia(message, 'message', `message:${idPart(path)}:${index}`, path, index);
     const body = text(message.content, message.text, message.body, message.message);
@@ -337,6 +431,11 @@ export function parseFacebookConversationWithMedia(raw: unknown, path: string): 
     if (senderName && !conversation.participantNames.includes(senderName)) conversation.participantNames.push(senderName);
     if (!conversation.participantIds.includes(senderId)) conversation.participantIds.push(senderId);
   });
+  // Older exports omit participant arrays; infer the names/IDs from messages.
+  for (const person of people) {
+    if (person.displayName && !conversation.participantNames.includes(person.displayName)) conversation.participantNames.push(person.displayName);
+    if (!conversation.participantIds.includes(person.id)) conversation.participantIds.push(person.id);
+  }
   return { conversation, messages, media, people };
 }
 export function parseFacebookConversation(raw: unknown, path: string): { conversation?: Conversation; messages: Message[] } { const parsed = parseFacebookConversationWithMedia(raw, path); return { conversation: parsed.conversation, messages: parsed.messages }; }

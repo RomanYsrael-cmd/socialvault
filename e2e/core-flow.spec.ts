@@ -98,7 +98,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByText(/metadata only/i)).toBeVisible();
 
   await page.reload();
-  await page.getByRole('link', { name: 'Archive' }).click();
+  await page.getByRole('link', { name: 'Archive', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Reconnect media' })).toBeVisible({ timeout: 15_000 });
   await page.locator('input[type=file]').setInputFiles({ name: 'synthetic-facebook.zip', mimeType: 'application/zip', buffer: Buffer.from(await blob.arrayBuffer()) });
   await expect(page.getByText(/Archive reconnected/)).toBeVisible({ timeout: 15_000 });
@@ -152,6 +152,7 @@ test('imports a multi-part Facebook archive as one logical set and reconnects pa
   await page.reload();
   await page.getByRole('link', { name: 'Archive' }).click();
   await expect(page.getByRole('heading', { name: 'Reconnect media' })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText('3 ZIP parts', { exact: true }).first()).toBeVisible();
   await page.locator('input[type=file]').setInputFiles([files[1], files[2]]);
   await expect(page.getByText(/Archive reconnected: 2 matched, 1 still missing/)).toBeVisible({ timeout: 15_000 });
   await page.getByRole('link', { name: 'Home' }).click();
@@ -182,4 +183,61 @@ test('keeps valid records when one selected ZIP part is malformed', async ({ pag
   await expect(page.getByText(/valid-part-copy\.zip: duplicate ZIP part selected/)).toBeVisible();
   await page.getByRole('link', { name: 'Home' }).click();
   await expect(page.getByRole('heading', { name: 'Valid part survives', exact: true })).toBeVisible();
+});
+
+test('cancels and resumes a multipart import after reconnecting the ZIP set', async ({ page }) => {
+  test.setTimeout(90_000);
+  const makeZip = async (entries: Record<string, unknown | string>) => {
+    const writer = new ZipWriter(new BlobWriter('application/zip'));
+    for (const [path, value] of Object.entries(entries)) await writer.add(path, new TextReader(typeof value === 'string' ? value : JSON.stringify(value)));
+    return writer.close();
+  };
+  const partOne = await makeZip({
+    'profile_information/profile_information.json': { profile_v2: { name: 'Resume User', username: 'resume_user' } },
+    'your_facebook_activity/posts/your_posts.json': [{ title: 'Resume post', data: [{ post: 'A post saved before cancellation.' }] }],
+  });
+  const partTwoEntries: Record<string, unknown> = {};
+  for (let index = 1; index <= 1_200; index++) partTwoEntries[`messages/inbox/resume_chat/message_${index}.json`] = { title: 'Resumable chat', participants: [{ name: 'Resume User' }, { name: 'Archive Friend' }], messages: [{ sender_name: index % 2 ? 'Archive Friend' : 'Resume User', timestamp_ms: 1700000000000 + index, content: index === 1_200 ? 'The final resumable message' : `Resumable message ${index}` }] };
+  const partTwo = await makeZip(partTwoEntries);
+  const files = [
+    { name: 'resume-export-part-1.zip', mimeType: 'application/zip', buffer: Buffer.from(await partOne.arrayBuffer()) },
+    { name: 'resume-export-part-2.zip', mimeType: 'application/zip', buffer: Buffer.from(await partTwo.arrayBuffer()) },
+  ];
+
+  await page.goto('/');
+  await page.locator('input[type=file]').setInputFiles(files);
+  await page.getByRole('button', { name: /Inspect archive set/ }).click();
+  await expect(page).toHaveURL(/\/archive$/, { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Start local import' }).click();
+  await expect(page.getByText(/Part 2 of 2/)).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'Cancel import' }).click();
+  await expect(page.getByText(/Import cancelled/)).toBeVisible({ timeout: 30_000 });
+
+  await page.reload();
+  await page.getByRole('link', { name: 'Archive', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Incomplete import found' })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/1 completed/)).toBeVisible();
+  await page.locator('input[type=file]').setInputFiles(files);
+  await expect(page.getByText(/Archive reconnected: 2 matched/)).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('button', { name: 'Resume import' }).click();
+  await expect(page.getByText(/Local import complete|Archive source disconnected/)).toBeVisible({ timeout: 60_000 });
+
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Resume post', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Messages', exact: true }).click();
+  await expect(page.getByRole('link', { name: /Resumable chat/ })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('link', { name: /Resumable chat/ }).click();
+  await expect(page.getByText('The final resumable message')).toBeVisible({ timeout: 15_000 });
+
+  await page.getByRole('link', { name: 'Archive', exact: true }).click();
+  await page.getByRole('button', { name: 'Rebuild search index' }).first().click();
+  await expect(page.getByText('Local search index rebuilt.')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole('heading', { name: 'Archive coverage' })).toBeVisible();
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export diagnostics' }).click();
+  const diagnostics = await download;
+  expect(diagnostics.suggestedFilename()).toBe('socialvault-diagnostics.json');
+  await page.getByRole('link', { name: 'Search', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Search archive' }).fill('final resumable');
+  await expect(page.getByText('The final resumable message')).toBeVisible({ timeout: 15_000 });
 });
