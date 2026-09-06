@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 3 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, locally normalize a supported subset of profile, post, Messenger, and media metadata, persist it in browser storage, and browse/search the imported records with SQL-backed pagination.
+> **Development status:** Milestone 4 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, normalize people, profile, post, Messenger, and media metadata locally, persist it in browser storage, and browse/search the imported records with SQL-backed pagination and on-demand media previews.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,7 +20,7 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 3 capabilities
+### Milestone 4 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
@@ -28,6 +28,9 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Guardrails for malformed ZIPs, traversal paths, entry counts, and very large entries
 - Incremental, tolerant Facebook adapter for common profile, posts, and Messenger paths
 - Source-file references retained on normalized profile, post, conversation, and message records
+- Rich person normalization with stable source-scoped identities, owner/participant distinction, identity confidence, first/last interaction dates, and source paths
+- Paginated People repository with SQL-derived message, post, media, and conversation participation counts
+- Read-only archive person pages with related posts and safe exact-profile/search links to Facebook when evidence exists
 - Section-level import progress and non-fatal malformed/unsupported JSON warnings
 - SQLite WebAssembly storage in a dedicated worker with schema migrations and indexed queries
 - Persistent OPFS database where supported; durable IndexedDB snapshot plus an in-memory SQLite query layer as fallback
@@ -38,23 +41,30 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Newest/oldest post ordering and year filtering
 - Efficient conversation previews with latest message, timestamp, participant summary, group indicator, and message count
 - Archive statistics calculated through SQLite aggregates
-- Metadata-only media indexing for supported post attachments and Messenger photos/files/videos; binary media is never extracted
-- Media path validation, missing-reference warnings, and a metadata-only Photos page
+- Metadata-only media indexing for supported post attachments and Messenger photos/files/videos; original bytes are decompressed only when a preview is requested
+- Media path/MIME allowlists, bounded object-URL cache, missing-reference warnings, responsive Photos grid, filters, and accessible image/video viewer
+- Timeline and Messenger attachment previews with lazy retrieval and reconnect messaging when the ZIP is unavailable
+- Virtualized long post/message lists using dynamic row measurement
+- FTS5 snippets with local highlighting and a safe SQL `LIKE` fallback
+- Deterministic local archive signatures for safe ZIP reconnection without re-importing matching text data
+- Import diagnostics for candidate, malformed, unsupported, missing-media, and incomplete-identity files
 - Archive overview with local import controls, summary, storage mode, and warnings
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
 ### Not implemented yet
 
-Binary photo/video extraction and rendering, comments/reactions, friend browsing, albums, complete Facebook format coverage, and virtualization are not implemented. The current text views remain intentionally lightweight.
+Comments/reactions, friend relationship detail, albums, bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, and extraction of unsupported media types are not implemented. The current views remain intentionally lightweight and read-only.
 
 ### Supported path assumptions
 
-The adapter currently recognizes profile files containing `profile_information` or `profile_v2`; post files below a `posts` directory or named `your_posts*.json`; and Messenger thread files matching `messages/inbox/*/message_*.json` or `messages/archived_threads/*/message_*.json`. Facebook changes its export format over time, so unrecognized files are skipped and malformed candidate JSON is reported as a warning.
+The adapter currently recognizes profile files containing `profile_information`, `profile_v2`, or a profile JSON basename; post files below a `posts` directory or named `your_posts*.json`; and Messenger thread files under `messages/inbox`, `messages/archived_threads`, or `messages/filtered_messages` with `message_*.json`/`message-*.json` names. It accepts common casing and field variants for names, IDs, timestamps, content, participants, and attachment references. Facebook changes its export format over time, so unrecognized files are skipped, malformed candidate JSON is reported as a warning, and diagnostics are shown in the archive overview.
 
 ### Browser storage
 
 On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Both stores are origin-private and device-local; clearing site data removes them.
+
+The imported text, people, search index, statistics, media metadata, and archive signature remain usable after a reload even when the original ZIP is not selected. Media previews then show a reconnect prompt. Selecting a ZIP only re-binds media when its filename, size, entry count, and deterministic local manifest fingerprint match the stored signature; a mismatch never auto-binds or re-imports.
 
 ### Planned Facebook archive support
 
@@ -91,7 +101,7 @@ Instead:
 3. Select or drag your Facebook ZIP archive into the application.
 4. SocialVault validates and processes the archive locally.
 5. Choose **Start local import** to parse supported JSON in a worker.
-6. Browse the basic normalized Profile, Posts, and Messages views.
+6. Browse the normalized Profile, People, Posts, Messages, Search, and Photos views.
 
 ```text
 Facebook ZIP
@@ -105,7 +115,7 @@ Local SQLite database
 SocialVault interface
 ```
 
-The SocialVault server serves the application itself.
+The application shell may be served by a web server, but archive contents are not sent to it.
 
 Your Facebook archive, Messenger conversations, photos, posts, and generated archive database are not intended to be uploaded to the SocialVault server.
 
@@ -165,7 +175,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The current persistence layer stores normalized profile, post, conversation, message, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table while preserving the existing migration system. Query APIs expose explicit cursor pages so React never loads full record sets.
+The current persistence layer stores normalized profile, people, post, conversation, message, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 
@@ -344,6 +354,10 @@ Future adapters may support exports from:
 Each platform remains responsible for determining what information is included in its exports.
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
+
+## Recommended Milestone 5
+
+Add scalable archive management: multi-archive workspaces, richer relationship and interaction records, comments/reactions, media thumbnail generation with cancellation, ranked search pagination, and an import diagnostics export. Keep all archive processing and storage local.
 
 ---
 

@@ -26,8 +26,19 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByText('22', { exact: true })).toBeVisible();
   await expect(page.getByText('1', { exact: true }).first()).toBeVisible();
 
+  await page.getByRole('link', { name: 'Profile' }).click();
+  await expect(page.getByRole('heading', { name: 'Synthetic User', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: /Open archive profile/ }).click();
+  await expect(page.getByRole('heading', { name: 'Synthetic User', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'People' }).click();
+  await expect(page.getByRole('link', { name: /Synthetic User/ }).first()).toBeVisible();
+
   await page.getByRole('link', { name: 'Home' }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic post 20', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Open synthetic.jpg/ })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole('button', { name: /Open synthetic.jpg/ }).click();
+  await expect(page.getByRole('dialog', { name: 'Media viewer' })).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Load older posts' }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic post 1', exact: true })).toBeVisible();
 
@@ -52,4 +63,10 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await page.getByRole('link', { name: 'Photos' }).click();
   await expect(page.getByText('synthetic.jpg')).toBeVisible();
   await expect(page.getByText(/metadata only/i)).toBeVisible();
+
+  await page.reload();
+  await page.getByRole('link', { name: 'Archive' }).click();
+  await expect(page.getByRole('heading', { name: 'Reconnect media' })).toBeVisible({ timeout: 15_000 });
+  await page.locator('input[type=file]').setInputFiles({ name: 'synthetic-facebook.zip', mimeType: 'application/zip', buffer: Buffer.from(await blob.arrayBuffer()) });
+  await expect(page.getByText(/Archive reconnected/)).toBeVisible({ timeout: 15_000 });
 });
