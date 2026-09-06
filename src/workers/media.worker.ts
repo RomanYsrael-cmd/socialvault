@@ -2,7 +2,7 @@
 import { BlobReader, BlobWriter, ZipReader } from '@zip.js/zip.js';
 import { isSuspiciousPath } from '../archive/security';
 
-type Request = { id: number; file: File; path: string; mimeType?: string };
+type Request = { id: number; file: File; path: string; mimeType?: string; archivePartId?: string };
 type Response = { id: number; ok: true; blob: Blob } | { id: number; ok: false; error: string };
 const clean = (path: string) => path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\//, '');
 const allowed = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'video/webm', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/ogg', 'audio/webm']);
@@ -11,15 +11,16 @@ const fallbackMime = (path: string) => {
   return ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : ext === 'mp4' || ext === 'm4v' ? 'video/mp4' : ext === 'webm' ? 'video/webm' : ext === 'mp3' ? 'audio/mpeg' : ext === 'wav' ? 'audio/wav' : ext === 'ogg' ? 'audio/ogg' : 'application/octet-stream';
 };
 self.onmessage = async (event: MessageEvent<Request>) => {
-  const { id, file, path } = event.data;
+  const { id, file, path, archivePartId } = event.data;
   let reader: ZipReader<Blob> | undefined;
   try {
-    const requested = clean(path);
-    if (!requested || isSuspiciousPath(requested)) throw new Error('This media path is not safe to open.');
+    const rawPath = path.replaceAll('\\', '/');
+    if (!rawPath || isSuspiciousPath(rawPath)) throw new Error('This media path is not safe to open.');
+    const requested = clean(rawPath);
     reader = new ZipReader(new BlobReader(file));
     const entries = await reader.getEntries();
     const entry = entries.find(candidate => !candidate.directory && clean(candidate.filename) === requested) ?? entries.find(candidate => !candidate.directory && clean(candidate.filename).endsWith(`/${requested}`));
-    if (!entry) throw new Error('Media entry is not present in the connected archive.');
+    if (!entry) throw new Error(`Media entry is not present in the connected archive${archivePartId ? ` part (${archivePartId})` : ''}.`);
     const mime = (event.data.mimeType && allowed.has(event.data.mimeType.toLowerCase()) ? event.data.mimeType.toLowerCase() : fallbackMime(requested));
     if (!allowed.has(mime)) throw new Error('This file type cannot be previewed safely.');
     const fileEntry = entry as unknown as { getData: (writer: BlobWriter) => Promise<Blob> };

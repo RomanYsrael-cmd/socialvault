@@ -38,7 +38,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await page.getByRole('link', { name: 'People', exact: true }).click();
   await expect(page.getByRole('link', { name: /Synthetic User/ }).first()).toBeVisible();
 
-  await page.getByRole('link', { name: 'Home' }).click();
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic post 20', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /Open synthetic.jpg/ })).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText('A lovely memory')).toBeVisible();
@@ -104,7 +104,82 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByText(/Archive reconnected/)).toBeVisible({ timeout: 15_000 });
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto('/home');
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.locator('header .mobile-nav a[href="/home"]').evaluate((element) => (element as HTMLElement).click());
   await expect(page.getByRole('heading', { name: 'Home', exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('imports a multi-part Facebook archive as one logical set and reconnects parts in batches', async ({ page }) => {
+  const makeZip = async (entries: Record<string, unknown | string>) => {
+    const writer = new ZipWriter(new BlobWriter('application/zip'));
+    for (const [path, value] of Object.entries(entries)) await writer.add(path, new TextReader(typeof value === 'string' ? value : JSON.stringify(value)));
+    return writer.close();
+  };
+  const partOne = await makeZip({
+    'profile_information/profile_information.json': { profile_v2: { name: 'Multipart User', username: 'multipart_user' } },
+    'your_facebook_activity/posts/your_posts__1.json': [{ timestamp: 1700000100, title: 'Part one post', data: [{ post: 'A post whose photo lives in another ZIP part.' }], attachments: [{ data: [{ media: { uri: 'photos/cross-part.jpg', mime_type: 'image/jpeg' } }, { media: { uri: 'photos/local-part.jpg', mime_type: 'image/jpeg' } }] }] }],
+    'photos/local-part.jpg': 'synthetic image bytes in part one',
+  });
+  const partTwo = await makeZip({
+    'messages/inbox/shared_chat/message_1.json': { title: 'Shared multipart chat', participants: [{ name: 'Multipart User' }, { name: 'Archive Friend' }], messages: [{ sender_name: 'Archive Friend', timestamp_ms: 1700000200000, content: 'Message chunk one' }] },
+    'photos/cross-part.jpg': 'synthetic image bytes',
+  });
+  const partThree = await makeZip({
+    'messages/inbox/shared_chat/message_2.json': { title: 'Shared multipart chat', participants: [{ name: 'Multipart User' }, { name: 'Archive Friend' }], messages: [{ sender_name: 'Multipart User', timestamp_ms: 1700000300000, content: 'Message chunk two' }] },
+  });
+  const files = [
+    { name: 'facebook-export-part-1.zip', mimeType: 'application/zip', buffer: Buffer.from(await partOne.arrayBuffer()) },
+    { name: 'facebook-export-part-2.zip', mimeType: 'application/zip', buffer: Buffer.from(await partTwo.arrayBuffer()) },
+    { name: 'facebook-export-part-3.zip', mimeType: 'application/zip', buffer: Buffer.from(await partThree.arrayBuffer()) },
+  ];
+  await page.goto('/');
+  await page.locator('input[type=file]').setInputFiles(files);
+  await expect(page.getByText('3 ZIP parts selected')).toBeVisible();
+  await page.getByRole('button', { name: /Inspect archive set/ }).click();
+  await expect(page).toHaveURL(/\/archive$/, { timeout: 15_000 });
+  await expect(page.getByText('3 ZIP parts', { exact: true }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Start local import' }).click();
+  await expect(page.getByRole('button', { name: /Imported/ })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('link', { name: 'Home' }).click();
+  await expect(page.getByRole('heading', { name: 'Part one post', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Open cross-part.jpg/ })).toBeVisible();
+  await page.getByRole('link', { name: 'Messages' }).click();
+  await expect(page.getByRole('link', { name: /Shared multipart chat/ })).toBeVisible();
+  await page.getByRole('link', { name: /Shared multipart chat/ }).click();
+  await expect(page.getByText('Message chunk one')).toBeVisible();
+  await expect(page.getByText('Message chunk two')).toBeVisible();
+  await page.reload();
+  await page.getByRole('link', { name: 'Archive' }).click();
+  await expect(page.getByRole('heading', { name: 'Reconnect media' })).toBeVisible({ timeout: 15_000 });
+  await page.locator('input[type=file]').setInputFiles([files[1], files[2]]);
+  await expect(page.getByText(/Archive reconnected: 2 matched, 1 still missing/)).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('link', { name: 'Home' }).click();
+  await expect(page.getByRole('button', { name: /Open cross-part.jpg/ })).toBeVisible();
+  await expect(page.getByText('Archive part not connected.')).toBeVisible();
+  await page.getByRole('link', { name: 'Archive' }).click();
+  await page.locator('input[type=file]').setInputFiles([files[0]]);
+  await expect(page.getByText(/Archive reconnected: 1 matched/)).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('link', { name: 'Home' }).click();
+  await expect(page.getByRole('button', { name: /Open local-part.jpg/ })).toBeVisible();
+});
+
+test('keeps valid records when one selected ZIP part is malformed', async ({ page }) => {
+  const writer = new ZipWriter(new BlobWriter('application/zip'));
+  await writer.add('profile_information/profile_information.json', new TextReader(JSON.stringify({ profile_v2: { name: 'Resilient User' } })));
+  await writer.add('your_facebook_activity/posts/your_posts.json', new TextReader(JSON.stringify([{ title: 'Valid part survives', data: [{ post: 'Imported despite a broken sibling ZIP.' }] }])));
+  const valid = { name: 'valid-part.zip', mimeType: 'application/zip', buffer: Buffer.from(await (await writer.close()).arrayBuffer()) };
+  const duplicate = { name: 'valid-part-copy.zip', mimeType: 'application/zip', buffer: valid.buffer };
+  const malformed = { name: 'broken-part.zip', mimeType: 'application/zip', buffer: Buffer.from('not a ZIP archive') };
+
+  await page.goto('/');
+  await page.locator('input[type=file]').setInputFiles([valid, duplicate, malformed]);
+  await page.getByRole('button', { name: /Inspect archive set/ }).click();
+  await expect(page).toHaveURL(/\/archive$/, { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Start local import' }).click();
+  await expect(page.getByRole('button', { name: /Imported/ })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(/broken-part\.zip: ZIP could not be inspected/)).toBeVisible();
+  await expect(page.getByText(/valid-part-copy\.zip: duplicate ZIP part selected/)).toBeVisible();
+  await page.getByRole('link', { name: 'Home' }).click();
+  await expect(page.getByRole('heading', { name: 'Valid part survives', exact: true })).toBeVisible();
 });

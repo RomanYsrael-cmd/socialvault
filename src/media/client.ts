@@ -1,4 +1,4 @@
-type Request = { id: number; file: File; path: string; mimeType?: string };
+type Request = { id: number; file: File; path: string; mimeType?: string; archivePartId?: string };
 type Response = { id: number; ok: true; blob: Blob } | { id: number; ok: false; error: string };
 let worker: Worker | undefined;
 let sequence = 0;
@@ -11,4 +11,4 @@ function getWorker() {
   }
   return worker;
 }
-export const mediaClient = { extract(file: File, path: string, mimeType?: string) { const id = ++sequence; return new Promise<Blob>((resolve, reject) => { pending.set(id, { resolve, reject }); getWorker().postMessage({ id, file, path, mimeType } satisfies Request); }); } };
+export const mediaClient = { extract(file: File, path: string, mimeType?: string, archivePartId?: string) { const id = ++sequence; return new Promise<Blob>((resolve, reject) => { pending.set(id, { resolve, reject }); getWorker().postMessage({ id, file, path, mimeType, archivePartId } satisfies Request); }); } };

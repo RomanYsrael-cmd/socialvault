@@ -1,8 +1,8 @@
 export type ID=string;
-export interface SourceRef{platform:string;path:string;index?:number}
+export interface SourceRef{platform:string;path:string;index?:number;archivePartId?:ID}
 export interface Archive{id:ID;platform:string;createdAt?:string}
 export type IdentityConfidence='exact'|'inferred'|'ambiguous';
-export interface Person{id:ID;displayName:string;facebookId?:string;username?:string;profileUrl?:string;profilePhotoPath?:string;coverPhotoPath?:string;firstSeen?:string;lastSeen?:string;relationship?:string;identityConfidence?:IdentityConfidence;identitySource?:string;sourcePaths?:string[];isArchiveOwner?:boolean}
+export interface Person{id:ID;displayName:string;facebookId?:string;username?:string;profileUrl?:string;profilePhotoPath?:string;coverPhotoPath?:string;firstSeen?:string;lastSeen?:string;relationship?:string;identityConfidence?:IdentityConfidence;identitySource?:string;sourcePaths?:string[];sourcePartIds?:string[];isArchiveOwner?:boolean}
 export interface ProfileFact{id:ID;category:string;label?:string;value:string;startDate?:string;endDate?:string;source:SourceRef}
 export interface Profile{id:ID;personId:ID;displayName:string;facebookId?:string;username?:string;profileUrl?:string;bio?:string;joinedAt?:string;relationship?:string;profilePhotoPath?:string;coverPhotoPath?:string;facts?:ProfileFact[];source:SourceRef}
 export interface Post{id:ID;authorId?:ID;authorName?:string;authorPhotoPath?:string;text?:string;title?:string;createdAt?:string;mediaCount?:number;commentCount?:number;reactionCount?:number;media?:Media[];comments?:Comment[];reactions?:Reaction[];source:SourceRef}
@@ -15,7 +15,11 @@ export interface Conversation{id:ID;title?:string;participantIds:ID[];participan
 export interface Message{id:ID;conversationId:ID;senderId?:ID;senderName?:string;text?:string;sentAt?:string;mediaCount?:number;media?:Media[];source:SourceRef}
 export interface Media{id:ID;path:string;mediaType:'photo'|'video'|'audio'|'file'|'unknown';filename?:string;mimeType?:string;caption?:string;timestamp?:string;ownerType:'post'|'message'|'album';ownerId:string;width?:number;height?:number;durationMs?:number;source:SourceRef}
 export interface ArchiveIdentity{filename:string;size:number;entryCount:number;fingerprint:string;knownEntries:string[]}
+/** A logical export assembled from one or more source ZIP parts. */
+export interface ArchiveSet{id:ID;platform:'facebook';createdAt:number;partCount:number;totalSize:number;fingerprint:string;importedAt?:string;status?:'complete'|'incomplete'|'failed'}
+/** Runtime/source metadata for one ZIP. File handles are deliberately not persisted here. */
+export interface ArchivePart{id:ID;archiveId:ID;partIndex:number;filename:string;fileSize:number;entryCount:number;manifestFingerprint:string;connected:boolean;status?:'ready'|'missing'|'failed'|'duplicate';warningCount?:number;sections?:string[]}
 export interface ImportDiagnostics{candidateFiles:number;parsedFiles:number;unsupportedCandidates:number;malformedFiles:number;missingMedia:number;incompleteIdentities:number}
 export type ActivityType='post'|'comment'|'reaction'|'message'|'connection'|'album'|'media'|'profile';
 export interface ActivityRecord{id:ID;type:ActivityType;actorPersonId?:ID;actorName?:string;targetType?:string;targetId?:ID;timestamp:string;summary:string;source:SourceRef}
-export interface NormalizedArchiveData{profile?:Profile;people:Person[];profileFacts:ProfileFact[];posts:Post[];comments:Comment[];reactions:Reaction[];connections:Connection[];albums:Album[];conversations:Conversation[];messages:Message[];media:Media[];warnings:string[];importedSections?:string[];diagnostics?:ImportDiagnostics;archiveIdentity?:ArchiveIdentity}
+export interface NormalizedArchiveData{profile?:Profile;people:Person[];profileFacts:ProfileFact[];posts:Post[];comments:Comment[];reactions:Reaction[];connections:Connection[];albums:Album[];conversations:Conversation[];messages:Message[];media:Media[];warnings:string[];importedSections?:string[];diagnostics?:ImportDiagnostics;archiveIdentity?:ArchiveIdentity;archiveSet?:ArchiveSet;archiveParts?:ArchivePart[]}

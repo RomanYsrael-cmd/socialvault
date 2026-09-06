@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 6 is complete. SocialVault can reconstruct a local social graph and browse it as a date-aware, Facebook-like archive home, including profile/About facts, posts, comments, reactions, friends/connections, albums, people, Messenger, media metadata, Memories, and Activity history.
+> **Development status:** Milestone 7 is complete. SocialVault can reconstruct a local social graph from a single Facebook ZIP or a multi-part Facebook export set, then browse it as a date-aware, Facebook-like archive home.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,9 +20,14 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 6 capabilities
+### Milestone 7 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
+- Multi-file selection and multi-drop for Facebook exports split across many ZIPs; all selected parts are treated as one logical archive
+- Lightweight part list with total count/size, per-part entry counts, duplicate-part warnings, and a bounded summary for large selections
+- Aggregate Facebook detection across partial exports (profile, posts, messages, photos, friends, albums, comments, reactions, and activity may live in different parts)
+- Deterministic order-independent archive-set fingerprint plus per-part manifest fingerprints for safe reconnects, including renamed matching ZIPs
+- Sequential ZIP inspection/import so large part sets do not create dozens of concurrent decompression streams
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
 - Extensible archive detector with Facebook structure/category recognition
 - Guardrails for malformed ZIPs, traversal paths, entry counts, and very large entries
@@ -32,6 +37,7 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Normalized albums and album-to-media membership with a simple album viewer
 - Profile About facts for work, education, places lived, relationship, usernames, languages, and other exported fields
 - Source-file references retained on normalized profile, post, conversation, and message records
+- Every normalized source carries an archive-part identity; media metadata is routed to the part containing its ZIP path, including cross-part post/media references
 - Rich person normalization with stable source-scoped identities, owner/participant distinction, identity confidence, first/last interaction dates, and source paths
 - Paginated People repository with SQL-derived message, post, media, and conversation participation counts
 - Read-only archive person pages with related posts, interaction counts, and safe exact-profile/search links to Facebook when evidence exists
@@ -48,6 +54,8 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Metadata-only media indexing for supported post attachments and Messenger photos/files/videos; original bytes are decompressed only when a preview is requested
 - Media path/MIME allowlists, bounded object-URL cache, missing-reference warnings, responsive Photos grid, filters, and accessible image/video viewer
 - Timeline and Messenger attachment previews with lazy retrieval and reconnect messaging when the ZIP is unavailable
+- Runtime archive-part → File registry for lazy media extraction; original ZIP bytes are never copied into SQLite/OPFS
+- Batch reconnect for all or a subset of parts, with missing/unexpected/duplicate diagnostics and text/search remaining available while media parts are absent
 - Virtualized long post/message lists using dynamic row measurement
 - FTS5 snippets with local highlighting and a safe SQL `LIKE` fallback
 - Deterministic local archive signatures for safe ZIP reconnection without re-importing matching text data
@@ -60,13 +68,13 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Paginated Activity history with local search, type/year filters, source references, and links to related records
 - Shared PersonDisplay identity rendering with initials fallback and internal person links
 - Responsive mobile navigation and layouts designed to avoid horizontal overflow on narrow screens
-- Version 5 activity ledger migration with derived calendar fields for efficient Memories and Activity queries
+- Version 6 archive-set migration with archive/part metadata, source-part columns, and automatic v5 single-ZIP backfill as part 1
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
 ### Not implemented yet
 
-Bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, comments/reaction editing, automatic media extraction, and multi-archive management are not implemented. The current views remain intentionally lightweight and read-only.
+Bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, comments/reaction editing, automatic media extraction, folder-level import on every browser, and multi-archive management are not implemented. The current views remain intentionally lightweight and read-only.
 
 ### Supported path assumptions
 
@@ -74,9 +82,9 @@ The adapter currently recognizes profile files containing `profile_information`,
 
 ### Browser storage
 
-On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Migration 5 adds a derived activity ledger; it is rebuilt from existing normalized tables when an older local database is opened. Both stores are origin-private and device-local; clearing site data removes them.
+On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Migration 5 adds a derived activity ledger and migration 6 adds the logical archive/part catalog and source-part references; an existing v5 single-ZIP database is automatically represented as archive part 1 without a destructive re-import. Both stores are origin-private and device-local; clearing site data removes them.
 
-The imported text, people, search index, statistics, media metadata, and archive signature remain usable after a reload even when the original ZIP is not selected. Media previews then show a reconnect prompt. Selecting a ZIP only re-binds media when its filename, size, entry count, and deterministic local manifest fingerprint match the stored signature; a mismatch never auto-binds or re-imports.
+The imported text, people, search index, statistics, media metadata, archive-set fingerprint, and per-part catalog remain usable after a reload even when none of the original ZIPs are selected. Media previews then show `Archive part not connected` for the relevant part. Select all available parts (or only a subset) in one reconnect action; matching uses the deterministic manifest fingerprint, with filename/size/entry count retained as diagnostics. A renamed but otherwise matching ZIP is accepted when its manifest identity matches; a mismatch never auto-binds or re-imports. File handles are runtime-only and are not serialized into SQLite or IndexedDB.
 
 ### Planned Facebook archive support
 
@@ -110,15 +118,15 @@ Instead:
 
 1. Download your information from Facebook in JSON format.
 2. Open SocialVault.
-3. Select or drag your Facebook ZIP archive into the application.
-4. SocialVault validates and processes the archive locally.
+3. Select or drag one or all ZIP parts into the application. If Facebook gave you 40 ZIP files, select all 40 together; SocialVault treats them as parts of one logical archive.
+4. SocialVault validates and processes each part locally, one at a time.
 5. Choose **Start local import** to parse supported JSON in a worker.
 6. Browse the normalized Profile/About, People/Friends, Posts, Albums, Messages, Search, and Photos views.
 
 ```text
-Facebook ZIP
+Facebook ZIP part(s)
      ↓
-Local archive parser
+Local archive-set parser (bounded, sequential)
      ↓
 Normalization
      ↓
@@ -187,7 +195,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The current persistence layer stores normalized profile, people, posts, comments, reactions, connections, albums, conversations, messages, profile facts, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs; migration 4 adds social graph tables and profile facts while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
+The current persistence layer stores normalized profile, people, posts, comments, reactions, connections, albums, conversations, messages, profile facts, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs; migration 4 adds social graph tables and profile facts; migration 5 adds the activity ledger; migration 6 adds archive sets, archive parts, and source-part references while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 
@@ -309,6 +317,8 @@ A Tauri desktop application may be introduced later for users with extremely lar
 
 SocialVault is designed with large archives in mind.
 
+Facebook may provide a download as dozens of ZIP files. Select all of those files in one operation; SocialVault records one logical archive with many parts, inspects/imports them sequentially, and never concatenates or copies the source ZIPs into browser storage. Part metadata is kept compact so a 40-part selection can be summarized without rendering every entry.
+
 The application architecture should avoid loading an entire ZIP archive into memory.
 
 Instead, it should:
@@ -321,6 +331,8 @@ Instead, it should:
 - Lazy-load photos and videos
 - Generate optional thumbnails
 - Paginate expensive queries
+
+If the browser is reopened later, normalized text and search remain available without the source files. Reconnect all available ZIPs—or only a subset—to restore lazy media previews. Media tied to a missing part remains visible as metadata and reports `Archive part not connected` rather than disabling the archive.
 
 The project should eventually be capable of handling archives containing millions of Messenger messages and tens of thousands of media files.
 
@@ -367,9 +379,9 @@ Each platform remains responsible for determining what information is included i
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
 
-## Recommended Milestone 7
+## Recommended Milestone 8
 
-Add memories polish and scalable social-history browsing: FTS5-backed activity search, richer interaction aggregation on Person pages, activity/post pagination improvements, media metadata indexing, and expanded Facebook export coverage. Keep all archive processing and storage local. Multi-archive workspaces should wait until the single-archive social graph is mature.
+Add richer social-history reconstruction on top of the archive set: comments/reactions threading improvements, interaction summaries on Person pages, scalable FTS/pagination tuning, resume checkpoints for interrupted imports, and broader Facebook export coverage. Keep all archive processing and storage local. Multi-archive workspaces and export merging should remain out of scope until this single logical archive experience is mature.
 
 ---
 

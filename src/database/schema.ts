@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=5;
+export const SCHEMA_VERSION=6;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -59,6 +59,34 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE INDEX IF NOT EXISTS idx_activity_type_date ON activity_records(activity_type,occurred_at DESC,id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_activity_year_date ON activity_records(calendar_year,occurred_at DESC,id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_activity_actor ON activity_records(actor_person_id,occurred_at DESC)`
+  ]},
+  {version:6,statements:[
+    `CREATE TABLE IF NOT EXISTS archive_sets (id TEXT PRIMARY KEY, platform TEXT NOT NULL, created_at INTEGER NOT NULL, part_count INTEGER NOT NULL, total_size INTEGER NOT NULL, fingerprint TEXT NOT NULL UNIQUE, imported_at TEXT, status TEXT NOT NULL DEFAULT 'complete')`,
+    `CREATE TABLE IF NOT EXISTS archive_parts (id TEXT PRIMARY KEY, archive_id TEXT NOT NULL, part_index INTEGER NOT NULL, filename TEXT NOT NULL, file_size INTEGER NOT NULL, entry_count INTEGER NOT NULL, manifest_fingerprint TEXT NOT NULL, connected INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'ready', warning_count INTEGER NOT NULL DEFAULT 0, sections TEXT NOT NULL DEFAULT '[]', FOREIGN KEY(archive_id) REFERENCES archive_sets(id))`,
+    `CREATE TABLE IF NOT EXISTS source_records (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, archive_part_id TEXT NOT NULL, PRIMARY KEY(entity_type,entity_id))`,
+    `ALTER TABLE posts ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE conversations ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE media ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE comments ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE reactions ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE connections ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE albums ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE profile_facts ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE person_sources ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE activity_records ADD COLUMN archive_part_id TEXT`,
+    `ALTER TABLE search_documents ADD COLUMN archive_part_id TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_archive_parts_archive ON archive_parts(archive_id,part_index)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_parts_manifest ON archive_parts(archive_id,manifest_fingerprint)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_records_part ON source_records(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_posts_part ON posts(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_messages_part ON messages(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_media_part ON media(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_comments_part ON comments(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_reactions_part ON reactions(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_connections_part ON connections(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_albums_part ON albums(archive_part_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_source_activity_part ON activity_records(archive_part_id)`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;
