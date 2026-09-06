@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 4 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, normalize people, profile, post, Messenger, and media metadata locally, persist it in browser storage, and browse/search the imported records with SQL-backed pagination and on-demand media previews.
+> **Development status:** Milestone 5 is complete. SocialVault can reconstruct a local social graph from a Facebook Download Your Information ZIP, including profile About facts, comments, reactions, friends/connections, albums, people, posts, Messenger, and media metadata.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,21 +20,25 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 4 capabilities
+### Milestone 5 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
 - Extensible archive detector with Facebook structure/category recognition
 - Guardrails for malformed ZIPs, traversal paths, entry counts, and very large entries
 - Incremental, tolerant Facebook adapter for common profile, posts, and Messenger paths
+- Normalized comments and reactions with actor, kind, timestamp, post target, and source-file references
+- Normalized friends, removed friends, followers/following, requests, and blocked connections with filtering
+- Normalized albums and album-to-media membership with a simple album viewer
+- Profile About facts for work, education, places lived, relationship, usernames, languages, and other exported fields
 - Source-file references retained on normalized profile, post, conversation, and message records
 - Rich person normalization with stable source-scoped identities, owner/participant distinction, identity confidence, first/last interaction dates, and source paths
 - Paginated People repository with SQL-derived message, post, media, and conversation participation counts
-- Read-only archive person pages with related posts and safe exact-profile/search links to Facebook when evidence exists
+- Read-only archive person pages with related posts, interaction counts, and safe exact-profile/search links to Facebook when evidence exists
 - Section-level import progress and non-fatal malformed/unsupported JSON warnings
 - SQLite WebAssembly storage in a dedicated worker with schema migrations and indexed queries
 - Persistent OPFS database where supported; durable IndexedDB snapshot plus an in-memory SQLite query layer as fallback
-- Read-only Profile, Posts, Conversations, and individual Conversation views
+- Read-only Profile/About, Posts/comments, Friends, Albums, Conversations, and individual Conversation views
 - SQLite FTS5 global search for posts, messages, conversation titles, participant names, and profile names, with a LIKE fallback when FTS5 is unavailable
 - Debounced grouped search results with links into posts, conversations, profiles, and matching message threads
 - Cursor-based pagination for posts, conversations, messages, media metadata, and search results
@@ -54,11 +58,11 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 
 ### Not implemented yet
 
-Comments/reactions, friend relationship detail, albums, bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, and extraction of unsupported media types are not implemented. The current views remain intentionally lightweight and read-only.
+Comments and reactions are currently shown as lightweight post threads; bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, comments/reaction editing, and extraction of unsupported media types are not implemented. The current views remain intentionally lightweight and read-only.
 
 ### Supported path assumptions
 
-The adapter currently recognizes profile files containing `profile_information`, `profile_v2`, or a profile JSON basename; post files below a `posts` directory or named `your_posts*.json`; and Messenger thread files under `messages/inbox`, `messages/archived_threads`, or `messages/filtered_messages` with `message_*.json`/`message-*.json` names. It accepts common casing and field variants for names, IDs, timestamps, content, participants, and attachment references. Facebook changes its export format over time, so unrecognized files are skipped, malformed candidate JSON is reported as a warning, and diagnostics are shown in the archive overview.
+The adapter currently recognizes profile files containing `profile_information`, `profile_v2`, or a profile JSON basename; post files below a `posts` directory or named `your_posts*.json`; comments/reactions files containing `comments`, `reactions`, `likes`, or nested interaction arrays; connection files containing `friends`, `followers`, `following`, `friend_requests`, or `connections`; album files containing `albums`; and Messenger thread files under `messages/inbox`, `messages/archived_threads`, or `messages/filtered_messages` with `message_*.json`/`message-*.json` names. It accepts common casing and field variants for names, IDs, timestamps, content, participants, relationship status, About facts, album media, and attachment references. Facebook changes its export format over time, so unrecognized files are skipped, malformed candidate JSON is reported as a warning, and diagnostics are shown in the archive overview.
 
 ### Browser storage
 
@@ -101,7 +105,7 @@ Instead:
 3. Select or drag your Facebook ZIP archive into the application.
 4. SocialVault validates and processes the archive locally.
 5. Choose **Start local import** to parse supported JSON in a worker.
-6. Browse the normalized Profile, People, Posts, Messages, Search, and Photos views.
+6. Browse the normalized Profile/About, People/Friends, Posts, Albums, Messages, Search, and Photos views.
 
 ```text
 Facebook ZIP
@@ -175,7 +179,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The current persistence layer stores normalized profile, people, post, conversation, message, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
+The current persistence layer stores normalized profile, people, posts, comments, reactions, connections, albums, conversations, messages, profile facts, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs; migration 4 adds social graph tables and profile facts while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 
@@ -355,9 +359,9 @@ Each platform remains responsible for determining what information is included i
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
 
-## Recommended Milestone 5
+## Recommended Milestone 6
 
-Add scalable archive management: multi-archive workspaces, richer relationship and interaction records, comments/reactions, media thumbnail generation with cancellation, ranked search pagination, and an import diagnostics export. Keep all archive processing and storage local.
+Add memories/On This Day, activity history, richer Facebook-like home/profile UX, interaction timelines, and more complete media/post context. Keep all archive processing and storage local. Multi-archive workspaces should wait until the single-archive social graph is mature.
 
 ---
 

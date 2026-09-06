@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=3;
+export const SCHEMA_VERSION=4;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -35,6 +35,23 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_name)`,
     `CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id)`,
     `CREATE INDEX IF NOT EXISTS idx_conversations_participant_ids ON conversations(participant_ids)`
+  ]},
+  {version:4,statements:[
+    `CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, post_id TEXT NOT NULL, author_id TEXT, author_name TEXT, body TEXT NOT NULL, created_at TEXT, source_path TEXT NOT NULL, source_index INTEGER, FOREIGN KEY(post_id) REFERENCES posts(id))`,
+    `CREATE TABLE IF NOT EXISTS reactions (id TEXT PRIMARY KEY, target_type TEXT NOT NULL, target_id TEXT NOT NULL, person_id TEXT, person_name TEXT, kind TEXT NOT NULL, created_at TEXT, source_path TEXT NOT NULL, source_index INTEGER)`,
+    `CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, person_id TEXT NOT NULL, display_name TEXT NOT NULL, facebook_id TEXT, username TEXT, profile_url TEXT, relationship_type TEXT NOT NULL, started_at TEXT, ended_at TEXT, source_path TEXT NOT NULL, source_index INTEGER)`,
+    `CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, owner_id TEXT, created_at TEXT, updated_at TEXT, source_path TEXT NOT NULL, source_index INTEGER)`,
+    `CREATE TABLE IF NOT EXISTS album_media (album_id TEXT NOT NULL, media_id TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(album_id,media_id))`,
+    `CREATE TABLE IF NOT EXISTS profile_facts (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, category TEXT NOT NULL, label TEXT, value TEXT NOT NULL, start_date TEXT, end_date TEXT, source_path TEXT NOT NULL, source_index INTEGER)`,
+    `CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments(post_id,created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_comments_author ON comments(author_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_type,target_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_reactions_person ON reactions(person_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_connections_type ON connections(relationship_type,display_name)`,
+    `CREATE INDEX IF NOT EXISTS idx_connections_person ON connections(person_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_albums_updated ON albums(updated_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_album_media_media ON album_media(media_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_profile_facts_profile ON profile_facts(profile_id,category)`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

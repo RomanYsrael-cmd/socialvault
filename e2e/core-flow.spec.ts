@@ -6,12 +6,14 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
     timestamp: 1700000000 + index * 86400,
     title: index === 21 ? 'Searchable post' : `Synthetic post ${index + 1}`,
     data: [{ post: index === 21 ? 'A unique bicycle memory for search.' : `Synthetic post body ${index + 1}.` }],
-    ...(index === 21 ? { attachments: [{ data: [{ media: { uri: 'photos/synthetic.jpg', mime_type: 'image/jpeg', description: 'Synthetic photo metadata' } }] }] } : {}),
+    ...(index === 21 ? { attachments: [{ data: [{ media: { uri: 'photos/synthetic.jpg', mime_type: 'image/jpeg', description: 'Synthetic photo metadata' } }] }], comments: [{ comment: 'A lovely memory', author: { id: 77, name: 'Archive Friend' }, timestamp: 1700000000 }], reactions: [{ type: 'Love', actor: { id: 77, name: 'Archive Friend' } }] } : {}),
   }));
   const writer = new ZipWriter(new BlobWriter('application/zip'));
-  await writer.add('profile_information/profile_information.json', new TextReader(JSON.stringify({ profile_v2: { name: 'Synthetic User', username: 'synthetic_user', bio: 'A fictional archive profile' } })));
+  await writer.add('profile_information/profile_information.json', new TextReader(JSON.stringify({ profile_v2: { name: 'Synthetic User', username: 'synthetic_user', bio: 'A fictional archive profile', work: [{ company: 'Archive Co', position: 'Historian' }], education: [{ school: 'Local University' }], relationship_status: 'In a relationship' } })));
   await writer.add('your_facebook_activity/posts/your_posts__1.json', new TextReader(JSON.stringify(posts)));
   await writer.add('messages/inbox/synthetic_chat/message_1.json', new TextReader(JSON.stringify({ title: 'Synthetic chat', participants: [{ name: 'Synthetic User' }, { name: 'Archive Friend' }], messages: [{ sender_name: 'Archive Friend', timestamp_ms: 1700000000000, content: 'A unique lantern message for search.', photos: [{ uri: 'messages/synthetic_chat/lantern.png', mime_type: 'image/png' }] }] })));
+  await writer.add('friends/your_friends.json', new TextReader(JSON.stringify([{ id: 77, name: 'Archive Friend', timestamp: 1700000000 }])));
+  await writer.add('photos_and_videos/albums.json', new TextReader(JSON.stringify([{ name: 'Synthetic summer', photos: [{ uri: 'photos/synthetic.jpg', mime_type: 'image/jpeg' }] }])));
   await writer.add('photos/synthetic.jpg', new TextReader('synthetic media fixture'));
   await writer.add('messages/synthetic_chat/lantern.png', new TextReader('synthetic media fixture'));
   const blob = await writer.close();
@@ -28,6 +30,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
 
   await page.getByRole('link', { name: 'Profile' }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic User', exact: true })).toBeVisible();
+  await expect(page.getByText('Archive Co')).toBeVisible();
   await page.getByRole('link', { name: /Open archive profile/ }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic User', exact: true })).toBeVisible();
   await page.getByRole('link', { name: 'People' }).click();
@@ -36,6 +39,8 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await page.getByRole('link', { name: 'Home' }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic post 20', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /Open synthetic.jpg/ })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText('A lovely memory')).toBeVisible();
+  await expect(page.getByText('Love · Archive Friend')).toBeVisible();
   await page.getByRole('button', { name: /Open synthetic.jpg/ }).click();
   await expect(page.getByRole('dialog', { name: 'Media viewer' })).toBeVisible();
   await page.keyboard.press('Escape');
@@ -46,6 +51,13 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByRole('link', { name: /Synthetic chat/ })).toBeVisible();
   await page.getByRole('link', { name: /Synthetic chat/ }).click();
   await expect(page.getByText('A unique lantern message for search.')).toBeVisible();
+
+  await page.getByRole('link', { name: 'Friends' }).click();
+  await expect(page.getByRole('link', { name: 'Archive Friend' })).toBeVisible();
+  await page.getByRole('link', { name: 'Albums' }).click();
+  await expect(page.getByRole('link', { name: 'Synthetic summer' })).toBeVisible();
+  await page.getByRole('link', { name: 'Synthetic summer' }).click();
+  await expect(page.getByText('synthetic.jpg').first()).toBeVisible();
 
   await page.getByRole('link', { name: 'Search', exact: true }).click();
   await page.getByRole('textbox', { name: 'Search archive' }).fill('bicycle memory');
@@ -61,7 +73,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.locator('article.message-match')).toContainText('A unique lantern message for search.');
 
   await page.getByRole('link', { name: 'Photos' }).click();
-  await expect(page.getByText('synthetic.jpg')).toBeVisible();
+  await expect(page.getByText('synthetic.jpg').first()).toBeVisible();
   await expect(page.getByText(/metadata only/i)).toBeVisible();
 
   await page.reload();

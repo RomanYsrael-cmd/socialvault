@@ -1,0 +1,13 @@
+import { useEffect, useState } from 'react';
+import { CalendarDays, LoaderCircle, Search, Users } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { database } from '../database/client';
+import type { ConnectionType } from '../archive/schemas/models';
+import type { ConnectionSummary, Page } from '../database/types';
+
+const labels: Record<string, string> = { friend: 'Friends', removed_friend: 'Removed friends', follower: 'Followers', following: 'Following', incoming_request: 'Incoming requests', outgoing_request: 'Outgoing requests', blocked: 'Blocked', unknown: 'Other connections' };
+export function FriendsPage() {
+  const [query, setQuery] = useState(''), [type, setType] = useState<ConnectionType | undefined>(), [page, setPage] = useState<Page<ConnectionSummary>>({ items: [], hasMore: false }), [loading, setLoading] = useState(true), [error, setError] = useState('');
+  useEffect(() => { let active = true; setLoading(true); database.connections({ query, type, limit: 50 }).then(next => active && setPage(next)).catch(value => active && setError(value instanceof Error ? value.message : String(value))).finally(() => active && setLoading(false)); return () => { active = false; }; }, [query, type]);
+  return <div className="page"><div className="page-heading-row"><div><p className="eyebrow">Social graph</p><h1 className="section-title">Friends & connections</h1><p className="section-lead">Relationships reconstructed from the local Facebook export.</p></div><Users/></div><div className="search-row"><label><Search/><input aria-label="Search connections" value={query} onChange={event => setQuery(event.target.value)} placeholder="Search names"/></label><select aria-label="Filter connection type" value={type ?? ''} onChange={event => setType((event.target.value || undefined) as ConnectionType | undefined)}><option value="">All connections</option>{Object.entries(labels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{loading ? <p className="empty"><LoaderCircle className="spin"/> Loading connections…</p> : error ? <p className="error">{error}</p> : !page.items.length ? <p className="empty">No connections matched this filter.</p> : <div className="connection-list">{page.items.map(connection => <article key={connection.id}><div><h2><Link to={`/people/${encodeURIComponent(connection.personId)}`}>{connection.displayName}</Link></h2><p>{labels[connection.type] ?? connection.type}{connection.username ? ` · @${connection.username}` : ''}</p></div><small>{connection.startedAt ? <><CalendarDays/> {new Date(connection.startedAt).toLocaleDateString()}</> : 'Date not available'}</small></article>)}</div>}</div>;
+}

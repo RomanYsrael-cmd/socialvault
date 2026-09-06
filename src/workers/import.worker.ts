@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 import { TextWriter, BlobReader, ZipReader } from '@zip.js/zip.js';
 import { detectArchive } from '../archive/detectors';
-import { emptyNormalizedData, findUnsafeMediaReferences, parseFacebookConversationWithMedia, parseFacebookPostsWithMedia, parseFacebookProfile, personFromProfile } from '../archive/adapters/facebook-parser';
+import { emptyNormalizedData, findUnsafeMediaReferences, parseFacebookAlbumsWithMedia, parseFacebookComments, parseFacebookConnections, parseFacebookConversationWithMedia, parseFacebookPostsWithMedia, parseFacebookProfile, parseFacebookReactions, personFromProfile } from '../archive/adapters/facebook-parser';
 import { isSuspiciousPath } from '../archive/security';
 import type { Person } from '../archive/schemas/models';
 import type { ImportProgress, ImportRequest } from './protocol';
@@ -9,11 +9,15 @@ import type { ImportProgress, ImportRequest } from './protocol';
 const send = (message: ImportProgress) => postMessage(message);
 const clean = (path: string) => path.replaceAll('\\', '/').replace(/^\.\//, '');
 const present = (path: string, paths: Set<string>) => paths.has(path) || [...paths].some(candidate => candidate.endsWith(`/${path}`));
-const candidateSection = (path: string): 'profile' | 'posts' | 'messages' | undefined => {
+const candidateSection = (path: string): 'profile' | 'posts' | 'comments' | 'reactions' | 'messages' | 'connections' | 'albums' | undefined => {
   const value = clean(path).toLowerCase();
   if (value.includes('profile_information') || value.includes('profile_v2') || value.endsWith('/profile.json') || value === 'profile.json') return 'profile';
   if (value.includes('/posts/') || /(?:^|\/)your_posts(?:__|[_-])?[^/]*\.json$/i.test(value)) return 'posts';
   if (/messages\/(inbox|archived_threads|filtered_messages)\/.+\/message(?:[_-]\d+)?\.json$/i.test(value)) return 'messages';
+  if (value.includes('comment')) return 'comments';
+  if (value.includes('reaction') || value.includes('like')) return 'reactions';
+  if (value.includes('friends') || value.includes('followers') || value.includes('following') || value.includes('friend_requests') || value.includes('connections')) return 'connections';
+  if (value.includes('albums') || value.includes('album')) return 'albums';
   return undefined;
 };
 const hash = (value: string) => {
@@ -73,11 +77,21 @@ self.onmessage = async (event: MessageEvent<File | ImportRequest>) => {
         findUnsafeMediaReferences(raw).forEach(unsafe => data.warnings.push(`${entry.filename}: suspicious media path skipped (${unsafe})`));
         if (section === 'profile') {
           const profile = parseFacebookProfile(raw, entry.filename);
-          if (profile) { data.profile ??= profile; addPerson(people, personFromProfile(profile), entry.filename); }
+          if (profile) { data.profile ??= profile; data.profileFacts.push(...(profile.facts ?? [])); addPerson(people, personFromProfile(profile), entry.filename); }
           else data.diagnostics.incompleteIdentities++;
         } else if (section === 'posts') {
           const parsed = parseFacebookPostsWithMedia(raw, entry.filename);
-          data.posts.push(...parsed.posts); data.media.push(...parsed.media);
+          data.posts.push(...parsed.posts); data.media.push(...parsed.media); data.comments.push(...parsed.comments); data.reactions.push(...parsed.reactions); parsed.people.forEach(person => addPerson(people, person, entry.filename));
+        } else if (section === 'comments') {
+          const parsed = parseFacebookComments(raw, entry.filename); data.comments.push(...parsed.comments); parsed.people.forEach(person => addPerson(people, person, entry.filename));
+        } else if (section === 'reactions') {
+          const parsed = parseFacebookReactions(raw, entry.filename); data.reactions.push(...parsed.reactions); parsed.people.forEach(person => addPerson(people, person, entry.filename));
+        } else if (section === 'connections') {
+          const parsed = parseFacebookConnections(raw, entry.filename);
+          data.connections.push(...parsed.connections); parsed.people.forEach(person => addPerson(people, person, entry.filename));
+        } else if (section === 'albums') {
+          const parsed = parseFacebookAlbumsWithMedia(raw, entry.filename);
+          data.albums.push(...parsed.albums); data.media.push(...parsed.media);
         } else {
           const parsed = parseFacebookConversationWithMedia(raw, entry.filename);
           if (parsed.conversation && !data.conversations.some(conversation => conversation.id === parsed.conversation!.id)) data.conversations.push(parsed.conversation);
@@ -98,6 +112,14 @@ self.onmessage = async (event: MessageEvent<File | ImportRequest>) => {
     for (const post of data.posts) {
       if (post.authorId) addPerson(people, { id: post.authorId, displayName: data.profile?.displayName ?? 'Archive owner', firstSeen: post.createdAt, lastSeen: post.createdAt, identityConfidence: post.authorId === 'owner' ? 'exact' : 'inferred', identitySource: post.source.path, sourcePaths: [post.source.path], isArchiveOwner: post.authorId === 'owner' });
     }
+    for (const comment of data.comments) {
+      if (comment.authorId && comment.authorName) addPerson(people, { id: comment.authorId, displayName: comment.authorName, firstSeen: comment.createdAt, lastSeen: comment.createdAt, identityConfidence: comment.authorId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: comment.source.path, sourcePaths: [comment.source.path] });
+    }
+    for (const reaction of data.reactions) {
+      if (reaction.personId && reaction.personName) addPerson(people, { id: reaction.personId, displayName: reaction.personName, firstSeen: reaction.createdAt, lastSeen: reaction.createdAt, identityConfidence: reaction.personId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: reaction.source.path, sourcePaths: [reaction.source.path] });
+    }
+    const unique = <T extends { id: string }>(items: T[]) => [...new Map(items.map(item => [item.id, item])).values()];
+    data.posts = unique(data.posts); data.comments = unique(data.comments); data.reactions = unique(data.reactions); data.connections = unique(data.connections); data.albums = unique(data.albums); data.messages = unique(data.messages); data.media = unique(data.media);
     data.people = [...people.values()];
     data.diagnostics.incompleteIdentities = data.people.filter(person => !person.facebookId && !person.username && !person.profileUrl).length;
     send({ type: 'progress', stage: 'media', message: 'Checking media references…', completed: data.media.length, total: data.media.length });

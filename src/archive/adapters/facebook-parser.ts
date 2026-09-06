@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { isSuspiciousPath } from '../security';
-import type { Conversation, Media, Message, NormalizedArchiveData, Person, Post, Profile } from '../schemas/models';
+import type { Album, Comment, Connection, ConnectionType, Conversation, Media, Message, NormalizedArchiveData, Person, Post, Profile, ProfileFact, Reaction } from '../schemas/models';
 
 const record = z.record(z.unknown());
 const asRecord = (value: unknown) => record.safeParse(value).success ? value as Record<string, unknown> : {};
@@ -13,7 +13,9 @@ const numberText = (...values: unknown[]) => {
 };
 const date = (value: unknown) => {
   if (typeof value !== 'number' && typeof value !== 'string') return undefined;
-  const numeric = typeof value === 'number' && value < 1e12 ? value * 1000 : Number(value);
+  if (typeof value === 'string' && /^\d{4}$/.test(value.trim())) return `${value.trim()}-01-01T00:00:00.000Z`;
+  const parsedNumber = Number(value);
+  const numeric = Number.isFinite(parsedNumber) && parsedNumber < 1e12 ? parsedNumber * 1000 : parsedNumber;
   const parsed = new Date(Number.isFinite(numeric) ? numeric : value as string);
   return Number.isNaN(parsed.valueOf()) ? undefined : parsed.toISOString();
 };
@@ -32,7 +34,7 @@ const profileUrl = (...values: unknown[]) => {
   return value && /^https?:\/\//i.test(value) ? value : undefined;
 };
 
-function collectMedia(value: unknown, ownerType: 'post' | 'message', ownerId: string, sourcePath: string, sourceIndex: number) {
+function collectMedia(value: unknown, ownerType: 'post' | 'message' | 'album', ownerId: string, sourcePath: string, sourceIndex: number) {
   const found: Media[] = [];
   const seen = new Set<string>();
   const walk = (node: unknown, depth: number) => {
@@ -90,12 +92,45 @@ export function findUnsafeMediaReferences(value: unknown): string[] {
 
 function profileRoot(raw: unknown) {
   const root = asRecord(raw);
-  const candidates = [root.profile_information, root.profile_v2, root.profile, root];
+  const candidates = [root.profile_information, root.profile_v2, root.profile, Array.isArray(raw) ? raw : undefined, root];
   for (const candidate of candidates) {
-    const value = asRecord(candidate);
+    const value = Array.isArray(candidate) ? asRecord(candidate[0]) : asRecord(candidate);
     if (Object.keys(value).length) return { root, value };
   }
   return { root, value: {} };
+}
+
+const FACT_KEYS: Record<string, string> = {
+  work: 'Work', jobs: 'Work', education: 'Education', schools: 'Education',
+  places_lived: 'Places lived', placesLived: 'Places lived', hometown: 'Hometown',
+  current_city: 'Places lived', currentCity: 'Places lived', relationship_status: 'Relationship',
+  relationship: 'Relationship', username_history: 'Username history', usernameHistory: 'Username history',
+  languages: 'Languages', family: 'Family', websites: 'Websites', other_names: 'Other names',
+};
+function factValues(value: unknown, label?: string, depth = 0): { label?: string; value: string; startDate?: string; endDate?: string }[] {
+  if (depth > 4 || value === undefined || value === null) return [];
+  if (typeof value === 'string' || typeof value === 'number') {
+    const result = String(value).trim(); return result ? [{ label, value: result }] : [];
+  }
+  if (Array.isArray(value)) return value.flatMap(item => factValues(item, label, depth + 1));
+  const object = asRecord(value);
+  const direct = text(object.value, object.name, object.title, object.text, object.description, object.school, object.company, object.position, object.city, object.location, object.username);
+  const result = direct ? [{ label: text(object.label, object.type, object.category) ?? label, value: direct, startDate: date(object.start_timestamp ?? object.start_date ?? object.from), endDate: date(object.end_timestamp ?? object.end_date ?? object.to) }] : [];
+  if (result.length) return result;
+  return Object.entries(object).flatMap(([key, child]) => key === 'timestamp' ? [] : factValues(child, label ?? key, depth + 1));
+}
+function parseProfileFacts(profile: Record<string, unknown>, root: Record<string, unknown>, path: string): ProfileFact[] {
+  const facts: ProfileFact[] = [];
+  const seen = new Set<string>();
+  for (const [key, category] of Object.entries(FACT_KEYS)) {
+    const value = profile[key] ?? root[key]; if (value === undefined) continue;
+    factValues(value).forEach((fact, index) => {
+      const id = `fact:${idPart(path)}:${key}:${index}:${idPart(fact.value)}`;
+      if (seen.has(id)) return; seen.add(id);
+      facts.push({ id, category, label: fact.label, value: fact.value, startDate: fact.startDate, endDate: fact.endDate, source: { platform: 'facebook', path, index } });
+    });
+  }
+  return facts;
 }
 
 export function parseFacebookProfile(raw: unknown, path: string): Profile | undefined {
@@ -108,6 +143,7 @@ export function parseFacebookProfile(raw: unknown, path: string): Profile | unde
   const exactProfileUrl = profileUrl(profile.profile_url, profile.profileUrl, profile.url, nested.profile_url);
   const photo = text(profile.profile_picture, profile.profile_photo, profile.profile_photo_uri, profile.profile_picture_uri, nested.profile_picture);
   const cover = text(profile.cover_photo, profile.cover_photo_uri, profile.cover_picture, nested.cover_photo);
+  const facts = parseProfileFacts(profile, root, path);
   return {
     id: 'owner',
     personId: 'owner',
@@ -119,36 +155,150 @@ export function parseFacebookProfile(raw: unknown, path: string): Profile | unde
     joinedAt: date(profile.registration_timestamp ?? profile.account_creation_time ?? profile.joined_at ?? profile.joinedAt),
     relationship: text(profile.relationship_status, profile.relationship, nested.relationship),
     profilePhotoPath: photo && !isSuspiciousPath(photo) && !/^https?:\/\//i.test(photo) ? normalizedPath(photo) : undefined,
-    coverPhotoPath: cover && !isSuspiciousPath(cover) && !/^https?:\/\//i.test(cover) ? normalizedPath(cover) : undefined,
+    coverPhotoPath: cover && !isSuspiciousPath(cover) && !/^https?:\/\//i.test(cover) ? normalizedPath(cover) : undefined, facts,
     source: { platform: 'facebook', path },
   };
 }
 
-export function parseFacebookPostsWithMedia(raw: unknown, path: string): { posts: Post[]; media: Media[] } {
+function listValue(value: unknown, keys: string[] = []) {
+  if (Array.isArray(value)) return value;
+  const object = asRecord(value);
+  for (const key of keys) if (Array.isArray(object[key])) return object[key] as unknown[];
+  if (Object.keys(object).length && !Object.values(object).some(item => typeof item === 'object' && item !== null)) return [value];
+  return Object.values(object).filter(item => item && typeof item === 'object');
+}
+function actorFrom(value: unknown, fallback: string, path: string): { id?: string; name?: string; facebookId?: string; person?: Person } {
+  const object = asRecord(value);
+  const nested = asRecord(object.actor ?? object.author ?? object.from ?? object.user ?? object.profile ?? object.reacter);
+  const source = Object.keys(nested).length ? nested : object;
+  const name = text(source.name, source.display_name, source.displayName, source.full_name, source.username, object.actor_name, object.author_name);
+  const facebookId = numberText(source.id, source.user_id, source.facebook_id, object.actor_id, object.author_id);
+  const id = facebookId ? `person:facebook:${facebookId}` : name ? `person:social:${idPart(path)}:${idPart(name)}` : undefined;
+  if (!id && !name) return {};
+  return { id, name, facebookId, person: id && name ? { id, displayName: name, facebookId, username: text(source.username, source.user_name), profileUrl: profileUrl(source.profile_url, source.profileUrl, source.url), identityConfidence: facebookId ? 'exact' : 'inferred', identitySource: path, sourcePaths: [path] } : undefined };
+}
+function parseComments(value: unknown, postId: string, path: string, postIndex: number): { comments: Comment[]; people: Person[] } {
+  const comments: Comment[] = [], people: Person[] = [];
+  const candidates = listValue(value, ['comments', 'comments_v2', 'comment_data', 'comment', 'data']);
+  candidates.forEach((item, index) => {
+    const object = asRecord(item);
+    const nestedItems = Array.isArray(object.data) ? object.data : [];
+    const source = [object, ...nestedItems.map(asRecord)].find(candidate => !!text(candidate.comment, candidate.text, candidate.content, candidate.body, candidate.message, asRecord(candidate.comment).text, asRecord(candidate.comment).comment));
+    const body = source ? text(source.comment, source.text, source.content, source.body, source.message, asRecord(source.comment).text, asRecord(source.comment).comment) : undefined;
+    if (!body) return;
+    const actor = actorFrom({ ...object, ...(source ?? {}) }, `comment:${postId}:${index}`, path);
+    const id = `comment:${idPart(path)}:${postIndex}:${index}`;
+    const createdAt = date(source?.timestamp ?? source?.timestamp_ms ?? source?.creation_timestamp ?? source?.created_at ?? object.timestamp ?? object.timestamp_ms);
+    comments.push({ id, postId, authorId: actor.id, authorName: actor.name, text: body, createdAt, source: { platform: 'facebook', path, index } });
+    if (actor.person) people.push({ ...actor.person, firstSeen: createdAt, lastSeen: createdAt });
+  });
+  return { comments, people };
+}
+function parseReactions(value: unknown, targetType: Reaction['targetType'], targetId: string, path: string, targetIndex: number): { reactions: Reaction[]; people: Person[] } {
+  const reactions: Reaction[] = [], people: Person[] = [];
+  const candidates = listValue(value, ['reactions', 'reactions_v2', 'likes', 'data']);
+  candidates.forEach((item, index) => {
+    const object = asRecord(item);
+    const nestedItems = Array.isArray(object.data) ? object.data : [];
+    const source = [object, ...nestedItems.map(asRecord)].find(candidate => !!text(candidate.reaction, candidate.type, candidate.kind, candidate.name, candidate.label, candidate.reaction_type));
+    const kind = text(source?.reaction, source?.type, source?.kind, source?.name, source?.label, source?.reaction_type) ?? (typeof item === 'string' ? item : undefined) ?? 'Like';
+    const actor = actorFrom({ ...object, ...(source ?? {}) }, `reaction:${targetId}:${index}`, path);
+    const timestamp = date(source?.timestamp ?? source?.timestamp_ms ?? source?.creation_timestamp ?? source?.created_at ?? object.timestamp ?? object.timestamp_ms);
+    const id = `reaction:${targetType}:${idPart(targetId)}:${index}`;
+    reactions.push({ id, targetType, targetId, personId: actor.id, personName: actor.name, kind, createdAt: timestamp, source: { platform: 'facebook', path, index } });
+    if (actor.person) people.push({ ...actor.person, firstSeen: timestamp, lastSeen: timestamp });
+  });
+  return { reactions, people };
+}
+export function parseFacebookComments(raw: unknown, path: string): { comments: Comment[]; people: Person[] } {
+  const root = asRecord(raw), sourceItems = Array.isArray(raw) ? raw : listValue(root, ['comments', 'comments_v2', 'comment_data', 'data']);
+  const comments: Comment[] = [], people: Person[] = [];
+  sourceItems.forEach((item, index) => { const object = asRecord(item), target = text(object.post_id, object.postId, object.target_id, object.targetId, asRecord(object.post).id) ?? `post:${idPart(path)}:${index}`; const parsed = parseComments([item], target, path, index); comments.push(...parsed.comments); people.push(...parsed.people); });
+  return { comments, people };
+}
+export function parseFacebookReactions(raw: unknown, path: string): { reactions: Reaction[]; people: Person[] } {
+  const root = asRecord(raw), sourceItems = Array.isArray(raw) ? raw : listValue(root, ['reactions', 'reactions_v2', 'likes', 'data']);
+  const reactions: Reaction[] = [], people: Person[] = [];
+  sourceItems.forEach((item, index) => { const object = asRecord(item), target = text(object.post_id, object.postId, object.target_id, object.targetId, asRecord(object.post).id) ?? `post:${idPart(path)}:${index}`; const parsed = parseReactions([item], 'post', target, path, index); reactions.push(...parsed.reactions); people.push(...parsed.people); });
+  return { reactions, people };
+}
+
+export function parseFacebookPostsWithMedia(raw: unknown, path: string): { posts: Post[]; media: Media[]; comments: Comment[]; reactions: Reaction[]; people: Person[] } {
   const root = asRecord(raw);
   const list = Array.isArray(raw) ? raw : Array.isArray(root.posts) ? root.posts : Array.isArray(root.data) ? root.data : [];
   const posts: Post[] = [];
-  const media: Media[] = [];
+  const media: Media[] = [], comments: Comment[] = [], reactions: Reaction[] = [], people: Person[] = [];
   list.forEach((item, index) => {
     const post = asRecord(item);
     const data = Array.isArray(post.data) ? post.data.map(asRecord) : [];
     const body = text(post.post, post.text, post.content, post.message, ...data.map(entry => entry.post ?? entry.text ?? entry.content));
     const attachments = collectMedia(post, 'post', `post:${idPart(path)}:${index}`, path, index);
+    const postId = `post:${idPart(path)}:${index}`;
+    const parsedComments = parseComments(post.comments ?? post.comments_v2 ?? post.comment_data ?? post.comment, postId, path, index);
+    const parsedReactions = parseReactions(post.reactions ?? post.reactions_v2 ?? post.likes, 'post', postId, path, index);
     if (!body && !text(post.title, post.name) && !attachments.length) return;
     const normalized = {
-      id: `post:${idPart(path)}:${index}`,
+      id: postId,
       authorId: 'owner',
       text: body,
       title: text(post.title, post.name),
       createdAt: date(post.timestamp ?? post.timestamp_ms ?? post.creation_timestamp ?? post.created_timestamp ?? post.created_time),
-      source: { platform: 'facebook', path, index },
+      commentCount: parsedComments.comments.length || Number(post.comment_count ?? post.comments_count ?? 0) || undefined,
+      reactionCount: parsedReactions.reactions.length || Number(post.reaction_count ?? post.reactions_count ?? post.likes_count ?? 0) || undefined,
+      comments: parsedComments.comments, reactions: parsedReactions.reactions, source: { platform: 'facebook', path, index },
     } satisfies Post;
     posts.push(normalized);
     media.push(...attachments);
+    comments.push(...parsedComments.comments); reactions.push(...parsedReactions.reactions); people.push(...parsedComments.people, ...parsedReactions.people);
   });
-  return { posts, media };
+  return { posts, media, comments, reactions, people };
 }
 export function parseFacebookPosts(raw: unknown, path: string): Post[] { return parseFacebookPostsWithMedia(raw, path).posts; }
+
+function connectionTypeFor(path: string, raw: Record<string, unknown>): ConnectionType {
+  const value = `${path} ${text(raw.type, raw.relationship, raw.status, raw.direction, raw.__relationship_key) ?? ''}`.toLowerCase();
+  if (value.includes('removed') || value.includes('unfriend')) return 'removed_friend';
+  if (value.includes('follower')) return 'follower';
+  if (value.includes('following')) return 'following';
+  if (value.includes('blocked')) return 'blocked';
+  if (value.includes('incoming') || value.includes('received')) return 'incoming_request';
+  if (value.includes('outgoing') || value.includes('sent')) return 'outgoing_request';
+  if (value.includes('friend')) return 'friend';
+  return 'unknown';
+}
+export function parseFacebookConnections(raw: unknown, path: string): { connections: Connection[]; people: Person[] } {
+  const root = asRecord(raw);
+  const sourceItems = Array.isArray(raw) ? raw : Object.entries(root).flatMap(([key, value]) => Array.isArray(value) ? value.map(item => ({ ...asRecord(item), __relationship_key: key })) : []);
+  const connections: Connection[] = [], people: Person[] = [];
+  sourceItems.forEach((item, index) => {
+    const object = asRecord(item), actor = actorFrom(object, `connection:${path}:${index}`, path);
+    const displayName = actor.name ?? text(object.name, object.display_name, object.full_name, object.username);
+    if (!displayName) return;
+    const facebookId = actor.facebookId ?? numberText(object.id, object.user_id, object.facebook_id);
+    const personId = actor.id ?? (facebookId ? `person:facebook:${facebookId}` : `person:connection:${idPart(path)}:${index}`);
+    const startedAt = date(object.timestamp ?? object.timestamp_ms ?? object.created_at ?? object.friendship_date ?? object.added_timestamp);
+    const endedAt = date(object.removed_timestamp ?? object.removed_at ?? object.unfriended_at);
+    const connection: Connection = { id: `connection:${idPart(path)}:${index}`, personId, displayName, facebookId, username: text(object.username, object.user_name), profileUrl: profileUrl(object.profile_url, object.profileUrl, object.url), type: connectionTypeFor(path, object), startedAt, endedAt, source: { platform: 'facebook', path, index } };
+    connections.push(connection);
+    people.push({ id: personId, displayName, facebookId, username: connection.username, profileUrl: connection.profileUrl, firstSeen: startedAt, lastSeen: endedAt ?? startedAt, identityConfidence: facebookId ? 'exact' : 'inferred', identitySource: path, sourcePaths: [path] });
+  });
+  return { connections, people };
+}
+
+export function parseFacebookAlbumsWithMedia(raw: unknown, path: string): { albums: Album[]; media: Media[] } {
+  const root = asRecord(raw), sourceItems = Array.isArray(raw) ? raw : listValue(root, ['albums', 'data']);
+  const albums: Album[] = [], media: Media[] = [];
+  sourceItems.forEach((item, index) => {
+    const object = asRecord(item), title = text(object.title, object.name, object.album_name);
+    if (!title) return;
+    const albumId = `album:${idPart(path)}:${index}`;
+    const children = object.media ?? object.photos ?? object.videos ?? object.items ?? object.contents ?? [];
+    const albumMedia = collectMedia(children, 'album', albumId, path, index);
+    albums.push({ id: albumId, title, description: text(object.description, object.caption), ownerId: numberText(object.owner_id, object.user_id) ? `person:facebook:${numberText(object.owner_id, object.user_id)}` : 'owner', createdAt: date(object.creation_timestamp ?? object.created_at ?? object.timestamp), updatedAt: date(object.update_timestamp ?? object.updated_at), mediaIds: albumMedia.map(item => item.id), source: { platform: 'facebook', path, index } });
+    media.push(...albumMedia);
+  });
+  return { albums, media };
+}
 
 const participantIdentity = (conversationId: string, name: string, facebookId?: string) => `person:messenger:${idPart(conversationId)}:${idPart(facebookId ?? name)}`;
 
@@ -195,4 +345,4 @@ export function personFromProfile(profile: Profile): Person {
   return { id: profile.personId, displayName: profile.displayName, facebookId: profile.facebookId, username: profile.username, profileUrl: profile.profileUrl, profilePhotoPath: profile.profilePhotoPath, coverPhotoPath: profile.coverPhotoPath, relationship: profile.relationship, identityConfidence: 'exact', identitySource: profile.source.path, sourcePaths: [profile.source.path], isArchiveOwner: true };
 }
 
-export function emptyNormalizedData(): NormalizedArchiveData { return { people: [], posts: [], conversations: [], messages: [], media: [], warnings: [] }; }
+export function emptyNormalizedData(): NormalizedArchiveData { return { people: [], profileFacts: [], posts: [], comments: [], reactions: [], connections: [], albums: [], conversations: [], messages: [], media: [], warnings: [] }; }
