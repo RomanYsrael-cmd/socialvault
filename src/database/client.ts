@@ -27,6 +27,7 @@ export const database = {
   importState(sessionId?: string) { return this.init().then(() => call<ImportState>({ type: 'import-state', sessionId })); },
   beginImport(session: ImportSession, parts: ArchivePart[], archiveSet?: NormalizedArchiveData['archiveSet'], archiveIdentity?: NormalizedArchiveData['archiveIdentity']) { return this.init().then(() => call<ImportState>({ type: 'begin-import', session, data: { ...emptyData(), archiveParts: parts, archiveSet, archiveIdentity } })); },
   importPart(sessionId: string, part: ArchivePart, data: NormalizedArchiveData) { return this.init().then(() => call<ImportPartCheckpoint>({ type: 'import-part', sessionId, part, data })); },
+  importBatch(sessionId: string, part: ArchivePart, data: NormalizedArchiveData) { return this.init().then(() => call<ImportPartCheckpoint>({ type: 'import-batch', sessionId, part, data })); },
   updateMediaSources(data: Pick<NormalizedArchiveData, 'media'>) { return this.init().then(() => call<void>({ type: 'update-media-sources', data: { ...emptyData(), media: data.media } })); },
   updateImport(sessionId: string, patch: Partial<ImportSession>) { return this.init().then(() => call<ImportSession>({ type: 'update-import', sessionId, session: { ...patch, id: sessionId } as ImportSession })); },
   cancelImport(sessionId: string) { return this.init().then(() => call<ImportSession>({ type: 'cancel-import', sessionId })); },

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=7;
+export const SCHEMA_VERSION=8;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -98,6 +98,11 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE TABLE IF NOT EXISTS diagnostic_warning_groups (session_id TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 0, source_paths TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(session_id,category,message), FOREIGN KEY(session_id) REFERENCES import_sessions(id))`,
     `CREATE INDEX IF NOT EXISTS idx_import_sessions_status ON import_sessions(status,updated_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_import_sections_session ON import_section_status(session_id,status)`
+  ]},
+  {version:8,statements:[
+    `ALTER TABLE archive_sets ADD COLUMN source_format TEXT`,
+    `ALTER TABLE archive_parts ADD COLUMN source_format TEXT`,
+    `ALTER TABLE posts ADD COLUMN links TEXT NOT NULL DEFAULT '[]'`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

@@ -23,4 +23,9 @@ describe('multi-part archive identity', () => {
     const merged = mergeNormalizedData([attributeArchivePart(first, 'archive-part:a'), attributeArchivePart(second, 'archive-part:b')]);
     expect(merged.posts.map(post => post.id)).toEqual(['post:1', 'post:2']); expect(merged.posts[0].source.archivePartId).toBe('archive-part:a'); expect(merged.posts[1].source.archivePartId).toBe('archive-part:b');
   });
+  it('marks a normalized merge as mixed when JSON and HTML parts coexist', () => {
+    const json = { ...emptyNormalizedData(), sourceFormat: 'json' as const };
+    const html = { ...emptyNormalizedData(), sourceFormat: 'html' as const };
+    expect(mergeNormalizedData([json, html]).sourceFormat).toBe('mixed');
+  });
 });

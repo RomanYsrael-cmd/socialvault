@@ -9,5 +9,7 @@ export function detectArchiveSet(parts: ArchiveEntryInfo[][]): DetectionResult {
   const supported = results.some(result => result.supported);
   const formats = [...new Set(results.map(result => result.format ?? 'unknown'))];
   const format = formats.includes('mixed') || (formats.includes('json') && formats.includes('html')) ? 'mixed' : formats.includes('json') ? 'json' : formats.includes('html') ? 'html' : 'unknown';
-  return { supported, platform: supported ? 'facebook' : 'unknown', confidence: supported ? Math.min(.99, .58 + sections.length * .05) : format === 'html' && sections.length ? .2 : .03, entryCount: results.reduce((sum, result) => sum + result.entryCount, 0), inspectedEntries: results.reduce((sum, result) => sum + result.inspectedEntries, 0), sections, supportedSections, unsupportedSections, warnings: results.flatMap(result => result.warnings), format };
+  const warnings = results.flatMap(result => result.warnings);
+  if (format === 'mixed' && !warnings.some(warning => /both JSON and HTML/i.test(warning))) warnings.push('This archive contains both JSON and HTML Facebook export files. JSON is preferred where a section has JSON coverage; supported HTML pages fill gaps.');
+  return { supported, platform: supported ? 'facebook' : 'unknown', confidence: supported ? Math.min(.99, .58 + sections.length * .05) : format === 'html' && sections.length ? .2 : .03, entryCount: results.reduce((sum, result) => sum + result.entryCount, 0), inspectedEntries: results.reduce((sum, result) => sum + result.inspectedEntries, 0), sections, supportedSections, unsupportedSections, warnings, format };
 }

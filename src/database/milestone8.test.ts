@@ -2,27 +2,27 @@ import { afterEach, describe, expect, it } from 'vitest';
 import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { FTS5_SCHEMA, MIGRATIONS, SCHEMA_VERSION } from './schema';
 
-describe('Milestone 8 persistence foundations', () => {
+describe('Milestone 9 persistence foundations', () => {
   let close: (() => void) | undefined;
   afterEach(() => close?.());
 
-  it('upgrades a v6 database with v7 session tables without losing rows', async () => {
+  it('upgrades a v6 database with versioned session and format tables without losing rows', async () => {
     const sqlite3 = await sqlite3InitModule(); const db = new sqlite3.oo1.DB(':memory:', 'c'); close = () => db.close();
     for (const migration of MIGRATIONS.slice(0, 6)) { for (const statement of migration.statements) db.exec(statement); db.exec({ sql: 'INSERT INTO schema_migrations VALUES(?,?)', bind: [migration.version, '2026-01-01'] }); }
     db.exec({ sql: 'INSERT INTO posts(id,body,source_path) VALUES(?,?,?)', bind: ['post:kept', 'kept record', 'posts.json'] });
-    for (const statement of MIGRATIONS[6].statements) db.exec(statement);
-    expect(db.selectValue('SELECT MAX(version) FROM schema_migrations')).toBe(6); // v7 is applied by the worker after this migration transaction
-    db.exec({ sql: 'INSERT INTO schema_migrations VALUES(?,?)', bind: [7, '2026-01-01'] });
+    for (const migration of MIGRATIONS.slice(6)) { for (const statement of migration.statements) db.exec(statement); db.exec({ sql: 'INSERT INTO schema_migrations VALUES(?,?)', bind: [migration.version, '2026-01-01'] }); }
     expect(db.selectValue('SELECT body FROM posts WHERE id=?', ['post:kept'])).toBe('kept record');
     expect(db.selectValue("SELECT name FROM sqlite_schema WHERE name='import_sessions'")).toBe('import_sessions');
     expect(db.selectValue("SELECT name FROM sqlite_schema WHERE name='import_part_checkpoints'")).toBe('import_part_checkpoints');
+    expect(db.selectValue("SELECT name FROM pragma_table_info('archive_sets') WHERE name='source_format'")).toBe('source_format');
+    expect(db.selectValue("SELECT name FROM pragma_table_info('posts') WHERE name='links'")).toBe('links');
     expect(db.selectValue('SELECT MAX(version) FROM schema_migrations')).toBe(SCHEMA_VERSION);
   });
 
   it('rolls back a part transaction instead of leaving half a checkpoint', async () => {
     const sqlite3 = await sqlite3InitModule(); const db = new sqlite3.oo1.DB(':memory:', 'c'); close = () => db.close();
     for (const migration of MIGRATIONS) for (const statement of migration.statements) db.exec(statement);
-    db.exec({ sql: 'INSERT INTO import_sessions(id,archive_set_id,started_at,updated_at,parser_version,schema_version) VALUES(?,?,?,?,?,?)', bind: ['session:1', 'set:1', '2026-01-01', '2026-01-01', 8, 7] });
+    db.exec({ sql: 'INSERT INTO import_sessions(id,archive_set_id,started_at,updated_at,parser_version,schema_version) VALUES(?,?,?,?,?,?)', bind: ['session:1', 'set:1', '2026-01-01', '2026-01-01', 9, 8] });
     expect(() => db.transaction(() => { db.exec({ sql: 'INSERT INTO posts(id,body,source_path) VALUES(?,?,?)', bind: ['post:partial', 'should rollback', 'posts.json'] }); throw new Error('simulated worker failure'); })).toThrow('simulated worker failure');
     expect(db.selectValue("SELECT COUNT(*) FROM posts WHERE id='post:partial'")).toBe(0);
   });

@@ -241,3 +241,67 @@ test('cancels and resumes a multipart import after reconnecting the ZIP set', as
   await page.getByRole('textbox', { name: 'Search archive' }).fill('final resumable');
   await expect(page.getByText('The final resumable message')).toBeVisible({ timeout: 15_000 });
 });
+
+test('imports a synthetic Facebook HTML export through the same local model', async ({ page }) => {
+  const writer = new ZipWriter(new BlobWriter('application/zip'));
+  const htmlProfile = '<!doctype html><html><body><h1>HTML Fixture User</h1><table class="_a6_n"><tr><th>Name</th><td>HTML Fixture User</td></tr><tr><th>Work</th><td>Archive Studio</td></tr></table><a href="https://www.facebook.com/profile.php?id=912345">profile</a></body></html>';
+  const htmlPosts = '<h1>Posts</h1><section class="_a6-g"><h2 class="_2ph_ _a6-h _a6-i">HTML Fixture User</h2><div class="_2ph_ _a6-p">A local HTML post &amp; entity</div><div class="_a72d">April 4, 2022</div><a href="../../photos/html-post.jpg"><img src="../../photos/html-post.jpg" alt="post photo"></a></section>';
+  const htmlMessages = '<h1>HTML Fixture Chat</h1><section class="_a6-g"><h2 class="_2ph_ _a6-h">HTML Fixture Chat</h2></section><section class="_a6-g"><h2 class="_2ph_ _a6-h _a6-i">HTML Friend</h2><div class="_2ph_ _a6-p">A local HTML message &amp; Unicode 你好</div><div class="_a72d">May 5, 2023</div></section>';
+  const htmlFriends = '<h1>Friends</h1><section class="_a6-g"><h2 class="_2ph_ _a6-h _a6-i">HTML Friend</h2><div class="_a72d">June 6, 2023</div></section>';
+  const htmlAlbum = '<h1>HTML Album</h1><img src="../../photos/html-album.jpg" alt="album photo">';
+  await writer.add('personal_information/profile_information/profile_information.html', new TextReader(htmlProfile));
+  await writer.add('your_facebook_activity/posts/your_posts_1.html', new TextReader(htmlPosts));
+  await writer.add('your_facebook_activity/messages/inbox/html-thread/message_1.html', new TextReader(htmlMessages));
+  await writer.add('connections/friends/your_friends.html', new TextReader(htmlFriends));
+  await writer.add('your_facebook_activity/posts/album/0.html', new TextReader(htmlAlbum));
+  await writer.add('photos/html-post.jpg', new TextReader('fixture photo'));
+  await writer.add('photos/html-album.jpg', new TextReader('fixture album photo'));
+  const blob = await writer.close();
+
+  await page.goto('/');
+  await page.locator('input[type=file]').setInputFiles({ name: 'synthetic-facebook-html.zip', mimeType: 'application/zip', buffer: Buffer.from(await blob.arrayBuffer()) });
+  await page.getByRole('button', { name: /Inspect archive/ }).click();
+  await expect(page).toHaveURL(/\/archive$/, { timeout: 15_000 });
+  await expect(page.getByText(/HTML export detected/)).toBeVisible();
+  await page.getByRole('button', { name: 'Start local import' }).click();
+  await expect(page.getByRole('button', { name: /Imported/ })).toBeVisible({ timeout: 30_000 });
+
+  await page.getByRole('link', { name: 'Profile', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'HTML Fixture User', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'HTML Fixture User', exact: true })).toBeVisible();
+  await expect(page.getByText('A local HTML post & entity')).toBeVisible();
+  await page.getByRole('link', { name: 'Messages', exact: true }).click();
+  await expect(page.getByRole('link', { name: /HTML Fixture Chat/ })).toBeVisible();
+  await page.getByRole('link', { name: /HTML Fixture Chat/ }).click();
+  await expect(page.getByText('A local HTML message & Unicode 你好')).toBeVisible();
+  await page.getByRole('link', { name: 'Friends', exact: true }).click();
+  await expect(page.getByRole('link', { name: /HTML Friend/ })).toBeVisible();
+  await page.getByRole('link', { name: 'Albums', exact: true }).click();
+  await expect(page.getByRole('link', { name: /HTML Album/ })).toBeVisible();
+
+  await page.getByRole('link', { name: 'Search', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Search archive' }).fill('local HTML message');
+  await expect(page.getByText('A local HTML message & Unicode 你好')).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('link', { name: /A local HTML message/ }).click();
+  await expect(page).toHaveURL(/\/messages\//);
+  await expect(page.getByText('A local HTML message & Unicode 你好')).toBeVisible();
+
+  await page.getByRole('link', { name: 'Photos', exact: true }).click();
+  await expect(page.getByText('html-post.jpg')).toBeVisible({ timeout: 15_000 });
+  const photoButton = page.getByRole('button', { name: /Open html-post\.jpg/ });
+  await expect(photoButton).toBeVisible({ timeout: 15_000 });
+  await photoButton.click();
+  await expect(page.getByRole('dialog', { name: 'Media viewer' })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('button', { name: 'Close media viewer' }).click();
+
+  await page.getByRole('link', { name: 'Memories', exact: true }).click();
+  await page.locator('input[type=date]').fill('2000-04-04');
+  await expect(page.getByText(/Posted/)).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('link', { name: 'Activity', exact: true }).click();
+  await expect(page.getByText(/Posted/)).toBeVisible({ timeout: 15_000 });
+
+  await page.getByRole('link', { name: 'Archive', exact: true }).click();
+  await expect(page.getByText('Facebook export format')).toBeVisible();
+  await expect(page.getByText('html', { exact: true })).toBeVisible();
+});

@@ -28,7 +28,9 @@ export function makeArchivePart(file: { name: string; size: number }, entries: M
 export function makeArchiveSet(parts: ArchivePart[], createdAt = Date.now()): ArchiveSet {
   const fingerprint = archiveSetFingerprint(parts);
   const id = archiveSetId(fingerprint);
-  return { id, platform: 'facebook', createdAt, partCount: parts.length, totalSize: parts.reduce((total, part) => total + part.fileSize, 0), fingerprint, status: 'complete' };
+  const formats = [...new Set(parts.map(part => part.sourceFormat).filter((format): format is Exclude<ArchivePart['sourceFormat'], undefined | 'unknown'> => !!format && format !== 'unknown'))];
+  const sourceFormat = formats.length > 1 ? 'mixed' as const : formats[0];
+  return { id, platform: 'facebook', createdAt, partCount: parts.length, totalSize: parts.reduce((total, part) => total + part.fileSize, 0), fingerprint, sourceFormat, status: 'complete' };
 }
 
 export interface PartMatchResult { matched: Array<{ expected: ArchivePart; candidate: ArchivePart }>; missing: ArchivePart[]; duplicates: ArchivePart[]; unexpected: ArchivePart[] }
@@ -83,6 +85,9 @@ export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedA
   const sectionDurations = new Map<string, number>();
   let totalDurationMs = 0;
   for (const data of parts) {
+    const incomingFormat = data.sourceFormat && data.sourceFormat !== 'unknown' ? data.sourceFormat : undefined;
+    if (incomingFormat) result.sourceFormat = !result.sourceFormat ? incomingFormat : result.sourceFormat === incomingFormat ? result.sourceFormat : 'mixed';
+    if (data.archiveSet && !result.archiveSet) result.archiveSet = data.archiveSet;
     if (data.profile && !result.profile) result.profile = data.profile;
     else if (data.profile && result.profile) result.profile = { ...result.profile, ...Object.fromEntries(Object.entries(data.profile).filter(([key, value]) => value && key !== 'source' && !((result.profile as unknown as Record<string, unknown>)[key]))), source: result.profile.source } as typeof result.profile;
     data.people.forEach(person => people.set(person.id, people.has(person.id) ? mergePeople(people.get(person.id)!, person) : person));
@@ -91,7 +96,9 @@ export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedA
     if (data.archiveParts) result.archiveParts = [...(result.archiveParts ?? []), ...data.archiveParts];
     if (data.diagnostics) {
       const current = result.diagnostics ?? { candidateFiles: 0, parsedFiles: 0, unsupportedCandidates: 0, malformedFiles: 0, missingMedia: 0, incompleteIdentities: 0 };
-      result.diagnostics = { candidateFiles: current.candidateFiles + data.diagnostics.candidateFiles, parsedFiles: current.parsedFiles + data.diagnostics.parsedFiles, unsupportedCandidates: current.unsupportedCandidates + data.diagnostics.unsupportedCandidates, malformedFiles: current.malformedFiles + data.diagnostics.malformedFiles, missingMedia: current.missingMedia + data.diagnostics.missingMedia, incompleteIdentities: current.incompleteIdentities + data.diagnostics.incompleteIdentities, shapeSignatures: [...new Set([...(current.shapeSignatures ?? []), ...(data.diagnostics.shapeSignatures ?? [])])].slice(0, 100), detectedSections: [...new Set([...(current.detectedSections ?? []), ...(data.diagnostics.detectedSections ?? [])])], unsupportedSections: [...new Set([...(current.unsupportedSections ?? []), ...(data.diagnostics.unsupportedSections ?? [])])] };
+      const incomingFormat = data.diagnostics.sourceFormat && data.diagnostics.sourceFormat !== 'unknown' ? data.diagnostics.sourceFormat : undefined;
+      const sourceFormat = incomingFormat ? !current.sourceFormat ? incomingFormat : current.sourceFormat === incomingFormat ? current.sourceFormat : 'mixed' : current.sourceFormat;
+      result.diagnostics = { candidateFiles: current.candidateFiles + data.diagnostics.candidateFiles, parsedFiles: current.parsedFiles + data.diagnostics.parsedFiles, unsupportedCandidates: current.unsupportedCandidates + data.diagnostics.unsupportedCandidates, malformedFiles: current.malformedFiles + data.diagnostics.malformedFiles, missingMedia: current.missingMedia + data.diagnostics.missingMedia, incompleteIdentities: current.incompleteIdentities + data.diagnostics.incompleteIdentities, htmlCandidateFiles: (current.htmlCandidateFiles ?? 0) + (data.diagnostics.htmlCandidateFiles ?? 0), htmlParsedFiles: (current.htmlParsedFiles ?? 0) + (data.diagnostics.htmlParsedFiles ?? 0), htmlRecordCount: (current.htmlRecordCount ?? 0) + (data.diagnostics.htmlRecordCount ?? 0), sourceFormat, shapeSignatures: [...new Set([...(current.shapeSignatures ?? []), ...(data.diagnostics.shapeSignatures ?? [])])].slice(0, 100), detectedSections: [...new Set([...(current.detectedSections ?? []), ...(data.diagnostics.detectedSections ?? [])])], unsupportedSections: [...new Set([...(current.unsupportedSections ?? []), ...(data.diagnostics.unsupportedSections ?? [])])] };
     }
     for (const group of data.warningGroups ?? data.diagnostics?.warningGroups ?? []) {
       const existing = warningGroups.get(group.category) ?? { category: group.category, message: group.message, count: 0, sourcePaths: new Set<string>() };
