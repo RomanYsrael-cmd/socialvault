@@ -2,8 +2,8 @@
 import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { getFallback, putFallback } from './indexeddb-fallback';
 import { FTS5_SCHEMA, MIGRATIONS } from './schema';
-import type { AlbumSummary, ArchiveStats, ConnectionSummary, ConversationPreview, DatabaseRequest, DatabaseResponse, Page, PersonSummary, SearchBackend, SearchResponse, SearchResult, StorageMode } from './types';
-import type { Album, ArchiveIdentity, Comment, Connection, Conversation, Media, Message, NormalizedArchiveData, Person, Post, Profile, ProfileFact, Reaction } from '../archive/schemas/models';
+import type { AlbumSummary, ArchiveStats, ConnectionSummary, ConversationPreview, DatabaseRequest, DatabaseResponse, MemoryRecord, Page, PersonSummary, SearchBackend, SearchResponse, SearchResult, StorageMode } from './types';
+import type { ActivityRecord, ActivityType, Album, ArchiveIdentity, Comment, Connection, Conversation, Media, Message, NormalizedArchiveData, Person, Post, Profile, ProfileFact, Reaction } from '../archive/schemas/models';
 
 type DB = { exec: (options: string | Record<string, unknown>) => unknown; transaction: (fn: () => void) => void };
 let db: DB;
@@ -38,7 +38,7 @@ function setupSearch() {
   try { db.exec(FTS5_SCHEMA); searchBackend = 'fts5'; } catch { searchBackend = 'like'; }
 }
 
-function normalizedData(data: NormalizedArchiveData): NormalizedArchiveData {
+function normalizedData(data: Partial<NormalizedArchiveData>): NormalizedArchiveData {
   return { ...data, people: data.people ?? [], profileFacts: data.profileFacts ?? data.profile?.facts ?? [], posts: data.posts ?? [], comments: data.comments ?? [], reactions: data.reactions ?? [], connections: data.connections ?? [], albums: data.albums ?? [], conversations: data.conversations ?? [], messages: data.messages ?? [], media: data.media ?? [], warnings: data.warnings ?? [] };
 }
 
@@ -68,7 +68,7 @@ function mapProfile(row?: Record<string, unknown>): Profile | undefined {
 
 function mapPost(row: Record<string, unknown>): Post {
   return {
-    id: String(row.id), authorId: row.authorId ? String(row.authorId) : undefined, title: row.title ? String(row.title) : undefined,
+    id: String(row.id), authorId: row.authorId ? String(row.authorId) : undefined, authorName: row.authorName ? String(row.authorName) : undefined, authorPhotoPath: row.authorPhotoPath ? String(row.authorPhotoPath) : undefined, title: row.title ? String(row.title) : undefined,
     text: row.text ? String(row.text) : undefined, createdAt: row.createdAt ? String(row.createdAt) : undefined,
     mediaCount: Number(row.mediaCount ?? 0), commentCount: Number(row.commentCount ?? 0), reactionCount: Number(row.reactionCount ?? 0), media: mediaForJson(row.mediaJson), comments: json<Comment[]>(row.commentsJson, []), reactions: json<Reaction[]>(row.reactionsJson, []),
     source: { platform: 'facebook', path: String(row.sourcePath), index: row.sourceIndex === null || row.sourceIndex === undefined ? undefined : Number(row.sourceIndex) },
@@ -112,7 +112,7 @@ function rebuildSearch(data: NormalizedArchiveData) {
   if (data.profile && !personIds.has(data.profile.id)) documents.push({ type: 'person', id: data.profile.id, title: data.profile.displayName, body: [data.profile.username, data.profile.bio].filter(Boolean).join(' '), source: data.profile.source.path });
   for (const fact of data.profileFacts ?? []) documents.push({ type: 'profile-fact', id: `fact:${fact.id}`, title: fact.category, body: [fact.label, fact.value].filter(Boolean).join(' '), context: `${fact.startDate ?? ''} ${fact.endDate ?? ''}`, source: fact.source.path });
   for (const post of data.posts) documents.push({ type: 'post', id: post.id, title: post.title, body: post.text, context: post.createdAt, createdAt: post.createdAt, source: post.source.path });
-  for (const comment of data.comments ?? []) documents.push({ type: 'comment', id: comment.id, title: comment.authorName, body: comment.text, context: comment.createdAt, createdAt: comment.createdAt, source: comment.source.path });
+  for (const comment of data.comments ?? []) documents.push({ type: 'comment', id: comment.id, title: comment.authorName, body: comment.text, context: comment.postId, createdAt: comment.createdAt, source: comment.source.path });
   for (const reaction of data.reactions ?? []) documents.push({ type: 'reaction', id: reaction.id, title: reaction.kind, body: reaction.personName, context: reaction.targetId, createdAt: reaction.createdAt, source: reaction.source.path });
   for (const connection of data.connections ?? []) documents.push({ type: 'connection', id: connection.id, title: connection.displayName, body: [connection.type, connection.username].filter(Boolean).join(' '), context: connection.startedAt ?? connection.endedAt, createdAt: connection.startedAt ?? connection.endedAt, source: connection.source.path });
   for (const album of data.albums ?? []) documents.push({ type: 'album', id: album.id, title: album.title, body: album.description, context: album.createdAt, createdAt: album.updatedAt ?? album.createdAt, source: album.source.path });
@@ -125,10 +125,33 @@ function rebuildSearch(data: NormalizedArchiveData) {
   }
 }
 
+const calendarParts = (timestamp: string) => { const value = new Date(timestamp); return { month: value.getUTCMonth() + 1, day: value.getUTCDate(), year: value.getUTCFullYear() }; };
+const compact = (value?: string) => value?.replace(/\s+/g, ' ').trim().slice(0, 160);
+function activityForData(data: NormalizedArchiveData): ActivityRecord[] {
+  const records: ActivityRecord[] = [];
+  const add = (id: string, type: ActivityType, timestamp: string | undefined, summary: string, source: { path: string; index?: number }, actorPersonId?: string, targetType?: string, targetId?: string) => {
+    if (!timestamp || !Number.isFinite(new Date(timestamp).getTime())) return;
+    records.push({ id, type, actorPersonId, targetType, targetId, timestamp, summary, source: { platform: 'facebook', path: source.path, index: source.index } });
+  };
+  if (data.profile) add(`activity:profile:${data.profile.id}`, 'profile', data.profile.joinedAt, `Profile: ${data.profile.displayName}`, data.profile.source, data.profile.personId, 'profile', data.profile.id);
+  for (const post of data.posts) add(`activity:post:${post.id}`, 'post', post.createdAt, `Posted${post.title ? ` “${post.title}”` : post.text ? ` “${compact(post.text)}”` : ''}`, post.source, post.authorId === 'owner' ? data.profile?.personId : post.authorId, 'post', post.id);
+  for (const comment of data.comments) add(`activity:comment:${comment.id}`, 'comment', comment.createdAt, `Commented${comment.authorName ? ` as ${comment.authorName}` : ''}: “${compact(comment.text) ?? ''}”`, comment.source, comment.authorId, 'post', comment.postId);
+  for (const reaction of data.reactions) add(`activity:reaction:${reaction.id}`, 'reaction', reaction.createdAt, `Reacted ${reaction.kind}${reaction.personName ? ` as ${reaction.personName}` : ''}`, reaction.source, reaction.personId, reaction.targetType, reaction.targetId);
+  for (const message of data.messages) add(`activity:message:${message.id}`, 'message', message.sentAt, `Message${message.senderName ? ` from ${message.senderName}` : ''}${message.text ? `: “${compact(message.text)}”` : ''}`, message.source, message.senderId, 'conversation', message.conversationId);
+  for (const connection of data.connections) add(`activity:connection:${connection.id}`, 'connection', connection.startedAt ?? connection.endedAt, `${connection.type.replaceAll('_', ' ')}: ${connection.displayName}`, connection.source, connection.personId, 'person', connection.personId);
+  for (const album of data.albums) add(`activity:album:${album.id}`, 'album', album.createdAt ?? album.updatedAt, `Album: ${album.title}`, album.source, album.ownerId, 'album', album.id);
+  for (const item of data.media) add(`activity:media:${item.id}`, 'media', item.timestamp, `Media: ${item.filename ?? item.path.split('/').pop() ?? 'unnamed'}`, item.source, undefined, item.ownerType, item.ownerId);
+  for (const fact of data.profileFacts) add(`activity:profile-fact:${fact.id}`, 'profile', fact.startDate ?? fact.endDate, `${fact.category}${fact.label ? ` · ${fact.label}` : ''}: ${fact.value}`, fact.source, data.profile?.personId, 'profile', data.profile?.id);
+  return [...new Map(records.map(record => [record.id, record])).values()];
+}
+function mapActivity(row: Record<string, unknown>): ActivityRecord {
+  return { id: String(row.id), type: String(row.activityType) as ActivityType, actorPersonId: row.actorPersonId ? String(row.actorPersonId) : undefined, actorName: row.actorName ? String(row.actorName) : undefined, targetType: row.targetType ? String(row.targetType) : undefined, targetId: row.targetId ? String(row.targetId) : undefined, timestamp: String(row.timestamp), summary: String(row.summary), source: { platform: 'facebook', path: String(row.sourcePath), index: row.sourceIndex === null || row.sourceIndex === undefined ? undefined : Number(row.sourceIndex) } };
+}
+
 function replace(input: NormalizedArchiveData) {
   const data = normalizedData(input);
   db.transaction(() => {
-    ['comments', 'reactions', 'album_media', 'albums', 'profile_facts', 'messages', 'conversations', 'posts', 'profiles', 'media', 'people', 'person_sources', 'import_metadata', 'archive_identity'].forEach(table => db.exec(`DELETE FROM ${table}`));
+    ['activity_records', 'comments', 'reactions', 'album_media', 'albums', 'profile_facts', 'messages', 'conversations', 'posts', 'profiles', 'media', 'people', 'person_sources', 'import_metadata', 'archive_identity'].forEach(table => db.exec(`DELETE FROM ${table}`));
     if (data.profile) db.exec({ sql: 'INSERT INTO profiles(id,person_id,display_name,username,bio,joined_at,source_path) VALUES(?,?,?,?,?,?,?)', bind: [data.profile.id, data.profile.personId, data.profile.displayName, data.profile.username ?? null, data.profile.bio ?? null, data.profile.joinedAt ?? null, data.profile.source.path] });
     for (const person of data.people) {
       db.exec({ sql: 'INSERT OR REPLACE INTO people(id,facebook_id,display_name,username,profile_url,profile_photo_path,cover_photo_path,first_seen,last_seen,relationship,identity_confidence,identity_source,source_paths,is_archive_owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', bind: [person.id, person.facebookId ?? null, person.displayName, person.username ?? null, person.profileUrl ?? null, person.profilePhotoPath ?? null, person.coverPhotoPath ?? null, person.firstSeen ?? null, person.lastSeen ?? null, person.relationship ?? null, person.identityConfidence ?? null, person.identitySource ?? null, JSON.stringify(person.sourcePaths ?? []), person.isArchiveOwner ? 1 : 0] });
@@ -146,6 +169,7 @@ function replace(input: NormalizedArchiveData) {
     for (const conversation of data.conversations) db.exec({ sql: 'INSERT INTO conversations(id,title,participant_names,source_path,is_group,participant_ids) VALUES(?,?,?,?,?,?)', bind: [conversation.id, conversation.title ?? null, JSON.stringify(conversation.participantNames), conversation.source.path, conversation.participantNames.length > 2 ? 1 : 0, JSON.stringify(conversation.participantIds)] });
     for (const message of data.messages) db.exec({ sql: 'INSERT INTO messages(id,conversation_id,sender_name,body,sent_at,source_path,source_index,sender_id) VALUES(?,?,?,?,?,?,?,?)', bind: [message.id, message.conversationId, message.senderName ?? null, message.text ?? null, message.sentAt ?? null, message.source.path, message.source.index ?? null, message.senderId ?? null] });
     for (const item of data.media) db.exec({ sql: 'INSERT INTO media(id,path,media_type,filename,mime_type,caption,timestamp,owner_type,owner_id,width,height,duration_ms,source_path,source_index) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', bind: [item.id, item.path, item.mediaType, item.filename ?? null, item.mimeType ?? null, item.caption ?? null, item.timestamp ?? null, item.ownerType, item.ownerId, item.width ?? null, item.height ?? null, item.durationMs ?? null, item.source.path, item.source.index ?? null] });
+    for (const activity of activityForData(data)) { const parts = calendarParts(activity.timestamp); db.exec({ sql: 'INSERT INTO activity_records(id,activity_type,actor_person_id,target_type,target_id,occurred_at,calendar_month,calendar_day,calendar_year,summary,source_path,source_index) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', bind: [activity.id, activity.type, activity.actorPersonId ?? null, activity.targetType ?? null, activity.targetId ?? null, activity.timestamp, parts.month, parts.day, parts.year, activity.summary, activity.source.path, activity.source.index ?? null] }); }
     const metadata: [string, string][] = [['warning_count', String(data.warnings.length)], ['section_count', String(data.importedSections?.length ?? 0)], ['sections', JSON.stringify(data.importedSections ?? [])], ['diagnostics', JSON.stringify(data.diagnostics ?? null)]];
     for (const [key, value] of metadata) db.exec({ sql: 'INSERT INTO import_metadata(key,value) VALUES(?,?)', bind: [key, value] });
     if (data.archiveIdentity) db.exec({ sql: 'INSERT INTO archive_identity(id,filename,size,entry_count,fingerprint,known_entries) VALUES(1,?,?,?,?,?)', bind: [data.archiveIdentity.filename, data.archiveIdentity.size, data.archiveIdentity.entryCount, data.archiveIdentity.fingerprint, JSON.stringify(data.archiveIdentity.knownEntries)] });
@@ -156,13 +180,43 @@ function replace(input: NormalizedArchiveData) {
 
 function postPage(request: DatabaseRequest): Page<Post> {
   const limit = limitOf(request.limit), sort = request.sort === 'oldest' ? 'oldest' : 'newest', cursor = decode(request.cursor), conditions: string[] = [], bind: unknown[] = [];
-  if (request.year) { conditions.push("substr(created_at,1,4)=?"); bind.push(String(request.year)); }
+  if (request.year) { conditions.push("substr(p.created_at,1,4)=?"); bind.push(String(request.year)); }
   if (request.personId) { conditions.push('author_id=?'); bind.push(request.personId); }
-  if (cursor) { if (sort === 'newest') { conditions.push("(COALESCE(created_at,'') < ? OR (COALESCE(created_at,'') = ? AND id < ?))"); bind.push(cursor.key, cursor.key, cursor.id); } else { conditions.push("(COALESCE(created_at,'') > ? OR (COALESCE(created_at,'') = ? AND id > ?))"); bind.push(cursor.key, cursor.key, cursor.id); } }
-  const query = `SELECT p.id,p.author_id authorId,p.title,p.body text,p.created_at createdAt,p.source_path sourcePath,p.source_index sourceIndex,(SELECT COUNT(*) FROM media m WHERE m.owner_type='post' AND m.owner_id=p.id) mediaCount,(SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) commentCount,(SELECT COUNT(*) FROM reactions r WHERE r.target_type='post' AND r.target_id=p.id) reactionCount,(SELECT json_group_array(json_object('id',m.id,'path',m.path,'mediaType',m.media_type,'filename',m.filename,'mimeType',m.mime_type,'caption',m.caption,'timestamp',m.timestamp,'ownerType',m.owner_type,'ownerId',m.owner_id,'width',m.width,'height',m.height,'durationMs',m.duration_ms,'sourcePath',m.source_path,'sourceIndex',m.source_index)) FROM media m WHERE m.owner_type='post' AND m.owner_id=p.id) mediaJson,(SELECT json_group_array(json_object('id',c.id,'postId',c.post_id,'authorId',c.author_id,'authorName',c.author_name,'text',c.body,'createdAt',c.created_at,'source',json_object('platform','facebook','path',c.source_path,'index',c.source_index))) FROM comments c WHERE c.post_id=p.id ORDER BY COALESCE(c.created_at,'') ASC,c.id) commentsJson,(SELECT json_group_array(json_object('id',r.id,'targetType',r.target_type,'targetId',r.target_id,'personId',r.person_id,'personName',r.person_name,'kind',r.kind,'createdAt',r.created_at,'source',json_object('platform','facebook','path',r.source_path,'index',r.source_index))) FROM reactions r WHERE r.target_type='post' AND r.target_id=p.id) reactionsJson FROM posts p ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''} ORDER BY COALESCE(created_at,'') ${sort === 'oldest' ? 'ASC' : 'DESC'},id ${sort === 'oldest' ? 'ASC' : 'DESC'} LIMIT ?`;
+  if (request.postId) { conditions.push('p.id=?'); bind.push(request.postId); }
+  if (cursor) { if (sort === 'newest') { conditions.push("(COALESCE(p.created_at,'') < ? OR (COALESCE(p.created_at,'') = ? AND p.id < ?))"); bind.push(cursor.key, cursor.key, cursor.id); } else { conditions.push("(COALESCE(p.created_at,'') > ? OR (COALESCE(p.created_at,'') = ? AND p.id > ?))"); bind.push(cursor.key, cursor.key, cursor.id); } }
+  const query = `SELECT p.id,p.author_id authorId,COALESCE((SELECT display_name FROM people WHERE id=p.author_id LIMIT 1),(SELECT display_name FROM profiles WHERE person_id=p.author_id LIMIT 1),(SELECT display_name FROM profiles LIMIT 1)) authorName,COALESCE((SELECT profile_photo_path FROM people WHERE id=p.author_id LIMIT 1),(SELECT profile_photo_path FROM people WHERE is_archive_owner=1 LIMIT 1)) authorPhotoPath,p.title,p.body text,p.created_at createdAt,p.source_path sourcePath,p.source_index sourceIndex,(SELECT COUNT(*) FROM media m WHERE m.owner_type='post' AND m.owner_id=p.id) mediaCount,(SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) commentCount,(SELECT COUNT(*) FROM reactions r WHERE r.target_type='post' AND r.target_id=p.id) reactionCount,(SELECT json_group_array(json_object('id',m.id,'path',m.path,'mediaType',m.media_type,'filename',m.filename,'mimeType',m.mime_type,'caption',m.caption,'timestamp',m.timestamp,'ownerType',m.owner_type,'ownerId',m.owner_id,'width',m.width,'height',m.height,'durationMs',m.duration_ms,'sourcePath',m.source_path,'sourceIndex',m.source_index)) FROM media m WHERE m.owner_type='post' AND m.owner_id=p.id) mediaJson,(SELECT json_group_array(json_object('id',c.id,'postId',c.post_id,'authorId',c.author_id,'authorName',c.author_name,'text',c.body,'createdAt',c.created_at,'source',json_object('platform','facebook','path',c.source_path,'index',c.source_index))) FROM comments c WHERE c.post_id=p.id ORDER BY COALESCE(c.created_at,'') ASC,c.id) commentsJson,(SELECT json_group_array(json_object('id',r.id,'targetType',r.target_type,'targetId',r.target_id,'personId',r.person_id,'personName',r.person_name,'kind',r.kind,'createdAt',r.created_at,'source',json_object('platform','facebook','path',r.source_path,'index',r.source_index))) FROM reactions r WHERE r.target_type='post' AND r.target_id=p.id) reactionsJson FROM posts p ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''} ORDER BY COALESCE(p.created_at,'') ${sort === 'oldest' ? 'ASC' : 'DESC'},p.id ${sort === 'oldest' ? 'ASC' : 'DESC'} LIMIT ?`;
   bind.push(limit + 1);
   const result = rows(query, bind), hasMore = result.length > limit, items = result.slice(0, limit).map(mapPost), last = items[items.length - 1];
   return { items, hasMore, nextCursor: hasMore && last ? encode({ key: last.createdAt ?? '', id: last.id }) : undefined };
+}
+function postById(postId?: string): Post | undefined { return postId ? postPage({ id: 0, type: 'posts', postId, limit: 1 }).items[0] : undefined; }
+function activityPage(request: DatabaseRequest): Page<ActivityRecord> {
+  const limit = limitOf(request.limit), cursor = decode(request.cursor), conditions: string[] = [], bind: unknown[] = [];
+  if (request.activityType) { conditions.push('a.activity_type=?'); bind.push(request.activityType); }
+  if (request.year) { conditions.push('a.calendar_year=?'); bind.push(request.year); }
+  if (request.query?.trim()) { conditions.push('(a.summary LIKE ? OR a.source_path LIKE ?)'); bind.push(`%${request.query.trim()}%`, `%${request.query.trim()}%`); }
+  if (cursor) { conditions.push("(a.occurred_at < ? OR (a.occurred_at = ? AND a.id < ?))"); bind.push(cursor.key, cursor.key, cursor.id); }
+  const result = rows(`SELECT a.id,a.activity_type activityType,a.actor_person_id actorPersonId,(SELECT display_name FROM people p WHERE p.id=a.actor_person_id LIMIT 1) actorName,a.target_type targetType,a.target_id targetId,a.occurred_at timestamp,a.summary,a.source_path sourcePath,a.source_index sourceIndex FROM activity_records a ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''} ORDER BY a.occurred_at DESC,a.id DESC LIMIT ?`, [...bind, limit + 1]);
+  const hasMore = result.length > limit, items = result.slice(0, limit).map(mapActivity), last = items[items.length - 1];
+  return { items, hasMore, nextCursor: hasMore && last ? encode({ key: last.timestamp, id: last.id }) : undefined };
+}
+function memories(month?: number, day?: number, limit?: number): MemoryRecord[] {
+  if (!month || !day) return [];
+  const currentYear = new Date().getUTCFullYear(), result = rows('SELECT a.id,a.activity_type activityType,a.actor_person_id actorPersonId,(SELECT display_name FROM people p WHERE p.id=a.actor_person_id LIMIT 1) actorName,a.target_type targetType,a.target_id targetId,a.occurred_at timestamp,a.summary,a.source_path sourcePath,a.source_index sourceIndex,a.calendar_year calendarYear FROM activity_records a WHERE a.calendar_month=? AND a.calendar_day=? ORDER BY a.calendar_year DESC,a.occurred_at DESC,a.id DESC LIMIT ?', [month, day, Math.min(100, Math.max(1, limit ?? 60))]);
+  const seen = new Set<string>();
+  return result.map(row => { const item = mapActivity(row); const dedupe = `${item.type}:${item.targetId ?? item.id}`; if (seen.has(dedupe)) return undefined; seen.add(dedupe); return { ...item, calendarYear: Number(row.calendarYear), yearsAgo: Math.max(0, currentYear - Number(row.calendarYear)) }; }).filter((item): item is MemoryRecord => !!item);
+}
+function rebuildActivityFromDatabase() {
+  if (Number(rows('SELECT COUNT(*) count FROM activity_records')[0]?.count ?? 0) > 0) return;
+  const source = { platform: 'facebook', path: 'database' };
+  const data = normalizedData({ people: [], profileFacts: [], posts: rows('SELECT id,author_id authorId,body text,created_at createdAt,source_path sourcePath FROM posts').map(row => ({ id: String(row.id), authorId: row.authorId ? String(row.authorId) : undefined, text: row.text ? String(row.text) : undefined, createdAt: row.createdAt ? String(row.createdAt) : undefined, source: { ...source, path: String(row.sourcePath) } } as Post)), comments: rows('SELECT id,post_id postId,author_id authorId,author_name authorName,body text,created_at createdAt,source_path sourcePath FROM comments').map(row => ({ id: String(row.id), postId: String(row.postId), authorId: row.authorId ? String(row.authorId) : undefined, authorName: row.authorName ? String(row.authorName) : undefined, text: String(row.text), createdAt: row.createdAt ? String(row.createdAt) : undefined, source: { ...source, path: String(row.sourcePath) } } as Comment)), reactions: rows('SELECT id,target_type targetType,target_id targetId,person_id personId,person_name personName,kind,created_at createdAt,source_path sourcePath FROM reactions').map(row => ({ id: String(row.id), targetType: String(row.targetType) as Reaction['targetType'], targetId: String(row.targetId), personId: row.personId ? String(row.personId) : undefined, personName: row.personName ? String(row.personName) : undefined, kind: String(row.kind), createdAt: row.createdAt ? String(row.createdAt) : undefined, source: { ...source, path: String(row.sourcePath) } } as Reaction)), connections: rows('SELECT id,person_id personId,display_name displayName,relationship_type type,started_at startedAt,ended_at endedAt,source_path sourcePath FROM connections').map(row => ({ id: String(row.id), personId: String(row.personId), displayName: String(row.displayName), type: String(row.type) as Connection['type'], startedAt: row.startedAt ? String(row.startedAt) : undefined, endedAt: row.endedAt ? String(row.endedAt) : undefined, source: { ...source, path: String(row.sourcePath) } } as Connection)), albums: rows('SELECT id,title,created_at createdAt,updated_at updatedAt,source_path sourcePath FROM albums').map(row => ({ id: String(row.id), title: String(row.title), createdAt: row.createdAt ? String(row.createdAt) : undefined, updatedAt: row.updatedAt ? String(row.updatedAt) : undefined, mediaIds: [], source: { ...source, path: String(row.sourcePath) } } as Album)), media: rows('SELECT id,filename,path,timestamp,owner_type ownerType,owner_id ownerId,source_path sourcePath FROM media').map(row => ({ id: String(row.id), filename: row.filename ? String(row.filename) : undefined, path: String(row.path), timestamp: row.timestamp ? String(row.timestamp) : undefined, ownerType: String(row.ownerType) as Media['ownerType'], ownerId: String(row.ownerId), mediaType: 'unknown', source: { ...source, path: String(row.sourcePath) } } as Media)), warnings: [] });
+  data.conversations = rows('SELECT id,title,participant_names participantNamesJson,participant_ids participantIdsJson,source_path sourcePath FROM conversations').map(row => ({ id: String(row.id), title: row.title ? String(row.title) : undefined, participantIds: json<string[]>(row.participantIdsJson, []), participantNames: json<string[]>(row.participantNamesJson, []), source: { platform: 'facebook', path: String(row.sourcePath) } } as Conversation));
+  data.messages = rows('SELECT id,conversation_id conversationId,sender_id senderId,sender_name senderName,body text,sent_at sentAt,source_path sourcePath,source_index sourceIndex FROM messages').map(row => ({ id: String(row.id), conversationId: String(row.conversationId), senderId: row.senderId ? String(row.senderId) : undefined, senderName: row.senderName ? String(row.senderName) : undefined, text: row.text ? String(row.text) : undefined, sentAt: row.sentAt ? String(row.sentAt) : undefined, source: { platform: 'facebook', path: String(row.sourcePath), index: row.sourceIndex === null || row.sourceIndex === undefined ? undefined : Number(row.sourceIndex) } } as Message));
+  const profileRow = rows('SELECT pr.id,pr.person_id personId,pr.display_name displayName,pr.username,pr.bio,pr.joined_at joinedAt,pr.source_path sourcePath FROM profiles pr LIMIT 1')[0];
+  data.profile = mapProfile(profileRow);
+  data.profileFacts = rows('SELECT id,category,label,value,start_date startDate,end_date endDate,source_path sourcePath,source_index sourceIndex FROM profile_facts').map(row => ({ id: String(row.id), category: String(row.category), label: row.label ? String(row.label) : undefined, value: String(row.value), startDate: row.startDate ? String(row.startDate) : undefined, endDate: row.endDate ? String(row.endDate) : undefined, source: { platform: 'facebook', path: String(row.sourcePath), index: row.sourceIndex === null || row.sourceIndex === undefined ? undefined : Number(row.sourceIndex) } } as ProfileFact));
+  const records = activityForData(data);
+  db.transaction(() => records.forEach(activity => { const parts = calendarParts(activity.timestamp); db.exec({ sql: 'INSERT OR IGNORE INTO activity_records(id,activity_type,actor_person_id,target_type,target_id,occurred_at,calendar_month,calendar_day,calendar_year,summary,source_path,source_index) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', bind: [activity.id, activity.type, activity.actorPersonId ?? null, activity.targetType ?? null, activity.targetId ?? null, activity.timestamp, parts.month, parts.day, parts.year, activity.summary, activity.source.path, activity.source.index ?? null] }); }));
 }
 
 function conversationPage(request: DatabaseRequest): Page<ConversationPreview> {
@@ -300,21 +354,21 @@ function identityFromRow(row?: Record<string, unknown>): ArchiveIdentity | undef
 
 function stats(): ArchiveStats {
   const count = (table: string) => Number(rows(`SELECT COUNT(*) count FROM ${table}`)[0]?.count ?? 0);
-  const range = rows("SELECT MIN(value) earliest,MAX(value) latest FROM (SELECT created_at value FROM posts WHERE created_at IS NOT NULL UNION ALL SELECT sent_at value FROM messages WHERE sent_at IS NOT NULL UNION ALL SELECT created_at value FROM comments WHERE created_at IS NOT NULL UNION ALL SELECT created_at value FROM reactions WHERE created_at IS NOT NULL)")[0];
-  const years = rows("SELECT DISTINCT CAST(substr(value,1,4) AS INTEGER) year FROM (SELECT created_at value FROM posts WHERE created_at IS NOT NULL UNION ALL SELECT sent_at value FROM messages WHERE sent_at IS NOT NULL UNION ALL SELECT created_at value FROM comments WHERE created_at IS NOT NULL UNION ALL SELECT created_at value FROM reactions WHERE created_at IS NOT NULL) WHERE year IS NOT NULL ORDER BY year DESC").map(row => Number(row.year));
+  const range = rows("SELECT MIN(occurred_at) earliest,MAX(occurred_at) latest FROM activity_records WHERE occurred_at IS NOT NULL")[0];
+  const years = rows("SELECT DISTINCT calendar_year year FROM activity_records WHERE calendar_year IS NOT NULL ORDER BY calendar_year DESC").map(row => Number(row.year));
   const diagnostics = json<NormalizedArchiveData['diagnostics'] | undefined>(rows("SELECT value FROM import_metadata WHERE key='diagnostics'")[0]?.value, undefined);
   const identity = identityFromRow(rows('SELECT filename,size,entry_count entryCount,fingerprint,known_entries knownEntries FROM archive_identity WHERE id=1')[0]);
-  return { profiles: count('profiles'), people: count('people'), posts: count('posts'), comments: count('comments'), reactions: count('reactions'), connections: count('connections'), albums: count('albums'), conversations: count('conversations'), messages: count('messages'), media: count('media'), earliest: range?.earliest ? String(range.earliest) : undefined, latest: range?.latest ? String(range.latest) : undefined, warnings: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), sections: Number(rows("SELECT value FROM import_metadata WHERE key='section_count'")[0]?.value ?? 0), years, diagnostics, archiveIdentity: identity };
+  return { profiles: count('profiles'), people: count('people'), posts: count('posts'), comments: count('comments'), reactions: count('reactions'), connections: count('connections'), albums: count('albums'), activities: count('activity_records'), conversations: count('conversations'), messages: count('messages'), media: count('media'), earliest: range?.earliest ? String(range.earliest) : undefined, latest: range?.latest ? String(range.latest) : undefined, warnings: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), sections: Number(rows("SELECT value FROM import_metadata WHERE key='section_count'")[0]?.value ?? 0), years, diagnostics, archiveIdentity: identity };
 }
 
 async function init() {
   const sqlite3 = await sqlite3InitModule();
   if (sqlite3.oo1.OpfsDb) {
     try { const OpfsDb = sqlite3.oo1.OpfsDb as unknown as new (filename: string, flags: string) => DB; db = new OpfsDb('/socialvault.sqlite3', 'c'); mode = 'opfs'; }
-    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; }
+    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; }
   } else db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB;
-  applyMigrations(); backfillPeopleFromLegacyTables(); setupSearch();
-  if (mode === 'indexeddb') { const saved = await getFallback(); if (saved) replace(saved); }
+  applyMigrations(); backfillPeopleFromLegacyTables(); rebuildActivityFromDatabase(); setupSearch();
+  if (mode === 'indexeddb') { try { const saved = await getFallback(); if (saved) replace(saved); } catch { /* in-memory SQLite remains usable when IndexedDB is unavailable or corrupt */ } }
   else if (Number(rows('SELECT COUNT(*) count FROM search_documents')[0]?.count ?? 0) === 0 && Number(rows('SELECT COUNT(*) count FROM posts')[0]?.count ?? 0) > 0) rebuildSearchFromDatabase();
   return { mode, searchBackend };
 }
@@ -323,17 +377,20 @@ self.onmessage = async (event: MessageEvent<DatabaseRequest>) => {
   const request = event.data;
   try {
     if (request.type === 'init') { send({ id: request.id, ok: true, data: await init() }); return; }
-    if (request.type === 'replace' && request.data) { replace(request.data); if (mode === 'indexeddb') await putFallback(normalizedData(request.data)); send({ id: request.id, ok: true }); return; }
+    if (request.type === 'replace' && request.data) { replace(request.data); if (mode === 'indexeddb') { try { await putFallback(normalizedData(request.data)); } catch { /* normalized data remains queryable in this session */ } } send({ id: request.id, ok: true }); return; }
     if (request.type === 'profile') { const row = rows("SELECT pr.id,pr.person_id personId,pr.display_name displayName,pr.username,pr.bio,pr.joined_at joinedAt,pr.source_path sourcePath,p.facebook_id facebookId,p.profile_url profileUrl,p.relationship,p.profile_photo_path profilePhotoPath,p.cover_photo_path coverPhotoPath,(SELECT json_group_array(json_object('id',f.id,'category',f.category,'label',f.label,'value',f.value,'startDate',f.start_date,'endDate',f.end_date,'source',json_object('platform','facebook','path',f.source_path,'index',f.source_index))) FROM profile_facts f WHERE f.profile_id=pr.id) factsJson FROM profiles pr LEFT JOIN people p ON p.id=pr.person_id LIMIT 1")[0]; send({ id: request.id, ok: true, data: mapProfile(row) }); return; }
     if (request.type === 'people') { send({ id: request.id, ok: true, data: peoplePage(request) }); return; }
     if (request.type === 'person') { send({ id: request.id, ok: true, data: personById(request.personId) }); return; }
     if (request.type === 'posts') { send({ id: request.id, ok: true, data: postPage(request) }); return; }
+    if (request.type === 'post') { send({ id: request.id, ok: true, data: postById(request.postId) }); return; }
     if (request.type === 'conversations') { send({ id: request.id, ok: true, data: conversationPage(request) }); return; }
     if (request.type === 'messages') { send({ id: request.id, ok: true, data: messagePage(request) }); return; }
     if (request.type === 'media') { send({ id: request.id, ok: true, data: mediaPage(request) }); return; }
     if (request.type === 'connections') { send({ id: request.id, ok: true, data: connectionsPage(request) }); return; }
     if (request.type === 'albums') { send({ id: request.id, ok: true, data: albumsPage(request) }); return; }
     if (request.type === 'album') { send({ id: request.id, ok: true, data: albumById(request.albumId) }); return; }
+    if (request.type === 'memories') { send({ id: request.id, ok: true, data: memories(request.month, request.day, request.limit) }); return; }
+    if (request.type === 'activity') { send({ id: request.id, ok: true, data: activityPage(request) }); return; }
     if (request.type === 'search') { send({ id: request.id, ok: true, data: search(request) }); return; }
     if (request.type === 'stats') { send({ id: request.id, ok: true, data: stats() }); return; }
     if (request.type === 'archive-identity') { send({ id: request.id, ok: true, data: identityFromRow(rows('SELECT filename,size,entry_count entryCount,fingerprint,known_entries knownEntries FROM archive_identity WHERE id=1')[0]) }); return; }

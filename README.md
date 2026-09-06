@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 5 is complete. SocialVault can reconstruct a local social graph from a Facebook Download Your Information ZIP, including profile About facts, comments, reactions, friends/connections, albums, people, posts, Messenger, and media metadata.
+> **Development status:** Milestone 6 is complete. SocialVault can reconstruct a local social graph and browse it as a date-aware, Facebook-like archive home, including profile/About facts, posts, comments, reactions, friends/connections, albums, people, Messenger, media metadata, Memories, and Activity history.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,7 +20,7 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 5 capabilities
+### Milestone 6 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
@@ -53,12 +53,20 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Deterministic local archive signatures for safe ZIP reconnection without re-importing matching text data
 - Import diagnostics for candidate, malformed, unsupported, missing-media, and incomplete-identity files
 - Archive overview with local import controls, summary, storage mode, and warnings
+- Archive Home feed with local archive context, Memories preview, post authors, and deep links to individual posts
+- Individual post pages with multi-media layouts, lazy previews, reaction breakdowns, progressive comment threads, and source metadata
+- Profile experience with cover/avatar placeholders, About facts, friend/photo/album previews, and archive-owner post links
+- On This Day Memories with UTC-safe date navigation, date picker, year grouping, and SQLite calendar indexes
+- Paginated Activity history with local search, type/year filters, source references, and links to related records
+- Shared PersonDisplay identity rendering with initials fallback and internal person links
+- Responsive mobile navigation and layouts designed to avoid horizontal overflow on narrow screens
+- Version 5 activity ledger migration with derived calendar fields for efficient Memories and Activity queries
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
 ### Not implemented yet
 
-Comments and reactions are currently shown as lightweight post threads; bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, comments/reaction editing, and extraction of unsupported media types are not implemented. The current views remain intentionally lightweight and read-only.
+Bulk thumbnail generation, pagination-aware search ranking, complete Facebook format coverage, comments/reaction editing, automatic media extraction, and multi-archive management are not implemented. The current views remain intentionally lightweight and read-only.
 
 ### Supported path assumptions
 
@@ -66,7 +74,7 @@ The adapter currently recognizes profile files containing `profile_information`,
 
 ### Browser storage
 
-On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Both stores are origin-private and device-local; clearing site data removes them.
+On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors normalized records to IndexedDB so they remain available across sessions. Migration 5 adds a derived activity ledger; it is rebuilt from existing normalized tables when an older local database is opened. Both stores are origin-private and device-local; clearing site data removes them.
 
 The imported text, people, search index, statistics, media metadata, and archive signature remain usable after a reload even when the original ZIP is not selected. Media previews then show a reconnect prompt. Selecting a ZIP only re-binds media when its filename, size, entry count, and deterministic local manifest fingerprint match the stored signature; a mismatch never auto-binds or re-imports.
 
@@ -359,9 +367,9 @@ Each platform remains responsible for determining what information is included i
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
 
-## Recommended Milestone 6
+## Recommended Milestone 7
 
-Add memories/On This Day, activity history, richer Facebook-like home/profile UX, interaction timelines, and more complete media/post context. Keep all archive processing and storage local. Multi-archive workspaces should wait until the single-archive social graph is mature.
+Add memories polish and scalable social-history browsing: FTS5-backed activity search, richer interaction aggregation on Person pages, activity/post pagination improvements, media metadata indexing, and expanded Facebook export coverage. Keep all archive processing and storage local. Multi-archive workspaces should wait until the single-archive social graph is mature.
 
 ---
 

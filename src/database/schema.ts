@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=4;
+export const SCHEMA_VERSION=5;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -52,6 +52,13 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE INDEX IF NOT EXISTS idx_albums_updated ON albums(updated_at DESC,id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_album_media_media ON album_media(media_id)`,
     `CREATE INDEX IF NOT EXISTS idx_profile_facts_profile ON profile_facts(profile_id,category)`
+  ]},
+  {version:5,statements:[
+    `CREATE TABLE IF NOT EXISTS activity_records (id TEXT PRIMARY KEY, activity_type TEXT NOT NULL, actor_person_id TEXT, target_type TEXT, target_id TEXT, occurred_at TEXT NOT NULL, calendar_month INTEGER NOT NULL, calendar_day INTEGER NOT NULL, calendar_year INTEGER NOT NULL, summary TEXT NOT NULL, source_path TEXT NOT NULL, source_index INTEGER)`,
+    `CREATE INDEX IF NOT EXISTS idx_activity_calendar ON activity_records(calendar_month,calendar_day,occurred_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_activity_type_date ON activity_records(activity_type,occurred_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_activity_year_date ON activity_records(calendar_year,occurred_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_activity_actor ON activity_records(actor_person_id,occurred_at DESC)`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

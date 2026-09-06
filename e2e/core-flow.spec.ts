@@ -2,8 +2,10 @@ import { test, expect } from '@playwright/test';
 import { BlobWriter, TextReader, ZipWriter } from '@zip.js/zip.js';
 
 test('imports and browses a synthetic archive with stats, pagination, search, and media metadata', async ({ page }) => {
+  const today = new Date();
+  const memoryTimestamp = Math.floor(Date.UTC(today.getUTCFullYear() - 10, today.getUTCMonth(), today.getUTCDate(), 12) / 1000);
   const posts = Array.from({ length: 22 }, (_, index) => ({
-    timestamp: 1700000000 + index * 86400,
+    timestamp: index === 0 ? memoryTimestamp : 1700000000 + index * 86400,
     title: index === 21 ? 'Searchable post' : `Synthetic post ${index + 1}`,
     data: [{ post: index === 21 ? 'A unique bicycle memory for search.' : `Synthetic post body ${index + 1}.` }],
     ...(index === 21 ? { attachments: [{ data: [{ media: { uri: 'photos/synthetic.jpg', mime_type: 'image/jpeg', description: 'Synthetic photo metadata' } }] }], comments: [{ comment: 'A lovely memory', author: { id: 77, name: 'Archive Friend' }, timestamp: 1700000000 }], reactions: [{ type: 'Love', actor: { id: 77, name: 'Archive Friend' } }] } : {}),
@@ -33,7 +35,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByText('Archive Co')).toBeVisible();
   await page.getByRole('link', { name: /Open archive profile/ }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic User', exact: true })).toBeVisible();
-  await page.getByRole('link', { name: 'People' }).click();
+  await page.getByRole('link', { name: 'People', exact: true }).click();
   await expect(page.getByRole('link', { name: /Synthetic User/ }).first()).toBeVisible();
 
   await page.getByRole('link', { name: 'Home' }).click();
@@ -41,11 +43,30 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByRole('button', { name: /Open synthetic.jpg/ })).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText('A lovely memory')).toBeVisible();
   await expect(page.getByText('Love · Archive Friend')).toBeVisible();
+  await page.getByRole('link', { name: 'Open post' }).first().click();
+  await expect(page).toHaveURL(/\/posts\//);
+  await expect(page.getByText('A lovely memory')).toBeVisible();
+  await page.getByRole('main').getByRole('link', { name: 'Home', exact: true }).click();
   await page.getByRole('button', { name: /Open synthetic.jpg/ }).click();
   await expect(page.getByRole('dialog', { name: 'Media viewer' })).toBeVisible();
   await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Load older posts' }).click();
   await expect(page.getByRole('heading', { name: 'Synthetic post 1', exact: true })).toBeVisible();
+
+  await page.goto('/memories');
+  await expect(page.getByRole('heading', { name: 'Memories', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: /Posted .*Synthetic post 1/ })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole('link', { name: /Posted .*Synthetic post 1/ }).click();
+  await expect(page).toHaveURL(/\/posts\//);
+  await page.getByRole('main').getByRole('link', { name: 'Home', exact: true }).click();
+
+  await page.goto('/activity');
+  await expect(page.getByRole('heading', { name: 'Activity', exact: true })).toBeVisible();
+  await expect(page.getByText('Posted “Synthetic post 1”', { exact: true })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole('combobox', { name: 'Activity type' }).selectOption('comment');
+  await expect(page.getByText(/A lovely memory/)).toBeVisible({ timeout: 10_000 });
+  await page.getByRole('link', { name: /Open post record/ }).first().click();
+  await expect(page).toHaveURL(/\/posts\//);
 
   await page.getByRole('link', { name: 'Messages' }).click();
   await expect(page.getByRole('link', { name: /Synthetic chat/ })).toBeVisible();
@@ -63,7 +84,7 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await page.getByRole('textbox', { name: 'Search archive' }).fill('bicycle memory');
   await expect(page.getByRole('link', { name: /A unique bicycle memory for search/ })).toBeVisible({ timeout: 10_000 });
   await page.getByRole('link', { name: /A unique bicycle memory for search/ }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await expect(page).toHaveURL(/\/posts\//);
 
   await page.getByRole('link', { name: 'Search', exact: true }).click();
   await page.getByRole('textbox', { name: 'Search archive' }).fill('lantern message');
@@ -81,4 +102,9 @@ test('imports and browses a synthetic archive with stats, pagination, search, an
   await expect(page.getByRole('heading', { name: 'Reconnect media' })).toBeVisible({ timeout: 15_000 });
   await page.locator('input[type=file]').setInputFiles({ name: 'synthetic-facebook.zip', mimeType: 'application/zip', buffer: Buffer.from(await blob.arrayBuffer()) });
   await expect(page.getByText(/Archive reconnected/)).toBeVisible({ timeout: 15_000 });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/home');
+  await expect(page.getByRole('heading', { name: 'Home', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

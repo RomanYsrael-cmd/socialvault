@@ -5,7 +5,7 @@ export type IdentityConfidence='exact'|'inferred'|'ambiguous';
 export interface Person{id:ID;displayName:string;facebookId?:string;username?:string;profileUrl?:string;profilePhotoPath?:string;coverPhotoPath?:string;firstSeen?:string;lastSeen?:string;relationship?:string;identityConfidence?:IdentityConfidence;identitySource?:string;sourcePaths?:string[];isArchiveOwner?:boolean}
 export interface ProfileFact{id:ID;category:string;label?:string;value:string;startDate?:string;endDate?:string;source:SourceRef}
 export interface Profile{id:ID;personId:ID;displayName:string;facebookId?:string;username?:string;profileUrl?:string;bio?:string;joinedAt?:string;relationship?:string;profilePhotoPath?:string;coverPhotoPath?:string;facts?:ProfileFact[];source:SourceRef}
-export interface Post{id:ID;authorId?:ID;text?:string;title?:string;createdAt?:string;mediaCount?:number;commentCount?:number;reactionCount?:number;media?:Media[];comments?:Comment[];reactions?:Reaction[];source:SourceRef}
+export interface Post{id:ID;authorId?:ID;authorName?:string;authorPhotoPath?:string;text?:string;title?:string;createdAt?:string;mediaCount?:number;commentCount?:number;reactionCount?:number;media?:Media[];comments?:Comment[];reactions?:Reaction[];source:SourceRef}
 export interface Comment{id:ID;postId:ID;authorId?:ID;authorName?:string;text:string;createdAt?:string;source:SourceRef}
 export interface Reaction{id:ID;targetType:'post'|'comment'|'message';targetId:string;personId?:ID;personName?:string;kind:string;createdAt?:string;source:SourceRef}
 export type ConnectionType='friend'|'removed_friend'|'follower'|'following'|'incoming_request'|'outgoing_request'|'blocked'|'unknown';
@@ -16,4 +16,6 @@ export interface Message{id:ID;conversationId:ID;senderId?:ID;senderName?:string
 export interface Media{id:ID;path:string;mediaType:'photo'|'video'|'audio'|'file'|'unknown';filename?:string;mimeType?:string;caption?:string;timestamp?:string;ownerType:'post'|'message'|'album';ownerId:string;width?:number;height?:number;durationMs?:number;source:SourceRef}
 export interface ArchiveIdentity{filename:string;size:number;entryCount:number;fingerprint:string;knownEntries:string[]}
 export interface ImportDiagnostics{candidateFiles:number;parsedFiles:number;unsupportedCandidates:number;malformedFiles:number;missingMedia:number;incompleteIdentities:number}
+export type ActivityType='post'|'comment'|'reaction'|'message'|'connection'|'album'|'media'|'profile';
+export interface ActivityRecord{id:ID;type:ActivityType;actorPersonId?:ID;actorName?:string;targetType?:string;targetId?:ID;timestamp:string;summary:string;source:SourceRef}
 export interface NormalizedArchiveData{profile?:Profile;people:Person[];profileFacts:ProfileFact[];posts:Post[];comments:Comment[];reactions:Reaction[];connections:Connection[];albums:Album[];conversations:Conversation[];messages:Message[];media:Media[];warnings:string[];importedSections?:string[];diagnostics?:ImportDiagnostics;archiveIdentity?:ArchiveIdentity}
