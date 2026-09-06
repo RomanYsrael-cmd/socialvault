@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 2 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, locally parse a supported subset of profile, post, and Messenger JSON, normalize it, persist it in browser storage, and show basic read-only archive views.
+> **Development status:** Milestone 3 is complete. SocialVault can inspect a Facebook Download Your Information ZIP, locally normalize a supported subset of profile, post, Messenger, and media metadata, persist it in browser storage, and browse/search the imported records with SQL-backed pagination.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,7 +20,7 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 2 capabilities
+### Milestone 3 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Browser Web Worker inspection using zip.js (the application does not call `file.arrayBuffer()`)
@@ -32,13 +32,21 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - SQLite WebAssembly storage in a dedicated worker with schema migrations and indexed queries
 - Persistent OPFS database where supported; durable IndexedDB snapshot plus an in-memory SQLite query layer as fallback
 - Read-only Profile, Posts, Conversations, and individual Conversation views
+- SQLite FTS5 global search for posts, messages, conversation titles, participant names, and profile names, with a LIKE fallback when FTS5 is unavailable
+- Debounced grouped search results with links into posts, conversations, profiles, and matching message threads
+- Cursor-based pagination for posts, conversations, messages, media metadata, and search results
+- Newest/oldest post ordering and year filtering
+- Efficient conversation previews with latest message, timestamp, participant summary, group indicator, and message count
+- Archive statistics calculated through SQLite aggregates
+- Metadata-only media indexing for supported post attachments and Messenger photos/files/videos; binary media is never extracted
+- Media path validation, missing-reference warnings, and a metadata-only Photos page
 - Archive overview with local import controls, summary, storage mode, and warnings
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
 ### Not implemented yet
 
-Photos and media extraction, comments/reactions, friend browsing, archive search/FTS5, complete Facebook format coverage, pagination/virtualization, and a polished timeline or Messenger reconstruction are not implemented. The current text views are intentionally basic.
+Binary photo/video extraction and rendering, comments/reactions, friend browsing, albums, complete Facebook format coverage, and virtualization are not implemented. The current text views remain intentionally lightweight.
 
 ### Supported path assumptions
 
@@ -157,7 +165,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The current persistence layer stores normalized profile, post, conversation, and message records in SQLite WASM. A versioned migration table provides the foundation for later schema evolution. Full-text search is not connected yet.
+The current persistence layer stores normalized profile, post, conversation, message, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table while preserving the existing migration system. Query APIs expose explicit cursor pages so React never loads full record sets.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 
@@ -174,7 +182,7 @@ Examples of indexed information include:
 - Media metadata
 - Activities
 
-SQLite FTS5 provides local full-text search for content such as messages, posts, comments, and people.
+SQLite FTS5 provides local full-text search for posts, messages, conversation titles, participants, and profiles. When a browser build cannot create FTS5, the same database worker falls back to a bounded SQL `LIKE` search over mirrored documents.
 
 Large media files remain associated with their original archive instead of unnecessarily being copied into the database.
 
