@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 9 is complete. SocialVault can import Facebook JSON or HTML export sets incrementally, checkpoint each ZIP part, resume after cancellation or reload, and browse the normalized archive locally.
+> **Development status:** Milestone 10 is complete. SocialVault can import large Facebook JSON or HTML export sets incrementally, checkpoint normalized source data and derived indexes, resume after cancellation or reload, and browse the archive locally while indexing continues.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -20,7 +20,7 @@ Support for additional social media platforms is planned.
 
 SocialVault aims to reconstruct as much of your downloaded social media history as possible from the data available in your archive.
 
-### Milestone 8 capabilities
+### Milestone 10 capabilities
 
 - Polished ZIP picker with drag and drop, validation, file details, and clear action
 - Multi-file selection and multi-drop for Facebook exports split across many ZIPs; all selected parts are treated as one logical archive
@@ -70,7 +70,7 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Paginated Activity history with local search, type/year filters, source references, and links to related records
 - Shared PersonDisplay identity rendering with initials fallback and internal person links
 - Responsive mobile navigation and layouts designed to avoid horizontal overflow on narrow screens
-- Version 8 archive-set/import-session migration with archive/part format metadata, resumable checkpoints, source-part columns, and automatic v5 single-ZIP backfill as part 1
+- Migrations 8–9 record archive/part format metadata, source/derived status, resumable checkpoints, and automatic v5 single-ZIP backfill as part 1
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
@@ -78,7 +78,7 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 
 - Persisted import state machine (`new`, `importing`, `indexing`, `complete`, `cancelled`, `interrupted`, and `failed`) with a session ID, parser/schema versions, counts, warnings, and timestamps
 - Schema migration 7 for import sessions, per-part checkpoints, section status, rebuild jobs, and aggregated diagnostic warning groups; v6 archives are upgraded as completed legacy sessions
-- Transactional part checkpoints: a ZIP part becomes complete only after its normalized records and derived activity rows commit successfully
+- Transactional part checkpoints: a ZIP part becomes complete only after its normalized source records commit successfully; derived search/activity rows are built and checkpointed in a separate resumable stage
 - Cancel/resume workflow that retains completed parts and safely leaves the current part pending; reloads show an explicit incomplete-import state instead of claiming completion
 - Fingerprint-based source reconnection for all or only a subset of remaining ZIP parts; renamed files can reconnect, mismatches never auto-bind, and completed parts are not reparsed
 - Explicit retry and skip actions for failed or unavailable parts, with incomplete coverage retained until the set is complete
@@ -87,8 +87,15 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Facebook parser version 9 with JSON/HTML profile, posts, Messenger, comments, reactions, connections, albums, attachment, timestamp, chunk-order, Unicode, and media-path compatibility fixtures
 - Detected-but-unsupported section reporting (for example Saved items, Search history, Groups, Events, Ads, Security, and Payments) plus section-level imported/partial/malformed status
 - Privacy-safe JSON diagnostics export with sanitized file extensions, structural shape signatures, warning categories, counts, checkpoints, coverage, and local performance timings—never archive text, names, raw JSON, or media bytes
-- Explicit transactional FTS5 and activity-index rebuild actions from normalized local tables; BM25 relevance ranking, deterministic cursors, entity filters, year/date filters, and a SQL `LIKE` fallback
+- Explicit checkpointed FTS5 and activity-index jobs from normalized local tables; BM25 relevance ranking, deterministic cursors, entity filters, year/date filters, and a SQL `LIKE` fallback
 - Bounded worker handoff: normalized HTML batches are acknowledged by the database worker before parsing proceeds; SQLite writes use bounded multi-row batches and ZIP-part checkpoints complete only after the final batch
+- Five-thousand-record producer/consumer batches keep HTML parsing and SQLite writes bounded; the parser waits for each database acknowledgement before continuing
+- Base-source completion is tracked separately from derived search/activity readiness, so imported records remain browseable while a long index build is paused
+- Checkpointed search and activity jobs record phase, row cursor, batch size, elapsed rows, errors, and completion timestamps in SQLite; resuming continues from the last committed batch
+- Derived indexing uses set-based `INSERT … SELECT` statements, bounded rowid windows, and yielding worker turns instead of materializing the archive in JavaScript
+- Import and derived-stage progress includes stage timings, stage counts, batch counts, and (on the fallback path) the persisted SQLite snapshot size
+- IndexedDB fallback stores a chunked SQLite WASM snapshot rather than duplicating all normalized messages/media as JavaScript objects; bounded chunks keep quota writes recoverable, and legacy object snapshots are still accepted for migration
+- An opt-in synthetic scale probe exercises the observed archive magnitudes (6k+ people, 12k+ posts, 6k+ conversations, 625k+ messages, and 60k+ media) without adding a large fixture to the routine test run; set `RUN_SOCIALVAULT_SCALE=1` when measuring it locally
 
 ### Not implemented yet
 
@@ -100,9 +107,9 @@ The adapter recognizes profile files containing `profile_information`, `profile_
 
 ### Browser storage
 
-On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. When OPFS cannot be initialized, SocialVault uses an in-memory SQLite database for queries and mirrors the normalized snapshot plus import-session state to IndexedDB so they remain available across sessions. Migration 5 adds the activity ledger, migration 6 adds the logical archive/part catalog, migration 7 adds sessions/checkpoints/section status/rebuild jobs/warning groups, and migration 8 records JSON/HTML format on archive sets and parts; an existing v6 archive is upgraded as a completed legacy session without a destructive re-import. Both stores are origin-private and device-local; clearing site data removes them.
+On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. Very large ZIP sets proactively use the fallback path to avoid an archive-sized OPFS write; when OPFS cannot be initialized—or a recoverable OPFS write/quota failure occurs—SocialVault uses an in-memory SQLite database for queries and stores a chunked SQLite WASM snapshot plus import-session state in IndexedDB so normalized rows and resumable checkpoints remain available across sessions. Snapshot chunks are written under a private generation and published only after all chunks commit; a quota failure leaves the previous readable snapshot intact. Migration 5 adds the activity ledger, migration 6 adds the logical archive/part catalog, migration 7 adds sessions/checkpoints/section status/rebuild jobs/warning groups, migration 8 records JSON/HTML format on archive sets and parts, and migration 9 records source/derived status plus checkpointed derived-index jobs; older databases are upgraded without a destructive re-import. Both stores are origin-private and device-local; clearing site data removes them.
 
-The imported text, people, search index, statistics, media metadata, archive-set fingerprint, and per-part checkpoints remain usable after a reload even when none of the original ZIPs are selected. An incomplete import is clearly labeled and keeps safely committed records available. Reconnect all available parts—or only a subset—in one file or folder action; matching uses the deterministic manifest fingerprint, with filename/size/entry count retained as diagnostics. A renamed but otherwise matching ZIP is accepted when its manifest identity matches; a mismatch never auto-binds or re-imports. File handles are runtime-only and are not serialized into SQLite or IndexedDB. A folder handle may require permission again after reload, so **Reconnect archive folder** is always available as a user-initiated action.
+The imported text, people, statistics, media metadata, archive-set fingerprint, and per-part checkpoints remain usable after a reload even when none of the original ZIPs are selected. Search and activity become available as their derived jobs finish; if either job is interrupted, the base source import remains clearly labeled and can resume from its last checkpoint. Reconnect all available parts—or only a subset—in one file or folder action; matching uses the deterministic manifest fingerprint, with filename/size/entry count retained as diagnostics. A renamed but otherwise matching ZIP is accepted when its manifest identity matches; a mismatch never auto-binds or re-imports. File handles are runtime-only and are not serialized into SQLite or IndexedDB. A folder handle may require permission again after reload, so **Reconnect archive folder** is always available as a user-initiated action.
 
 ### Planned Facebook archive support
 
@@ -214,7 +221,7 @@ SocialVault must not guess that an unrelated Facebook profile belongs to someone
 
 ## Local Archive Database
 
-The current persistence layer stores normalized profile, people, posts, comments, reactions, connections, albums, conversations, messages, profile facts, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs; migration 4 adds social graph tables and profile facts; migration 5 adds the activity ledger; migration 6 adds archive sets, archive parts, and source-part references; migration 7 adds import sessions, per-part checkpoints, section status, rebuild jobs, and warning groups; migration 8 records each logical set/part's source format while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
+The current persistence layer stores normalized profile, people, posts, comments, reactions, connections, albums, conversations, messages, profile facts, and media metadata records in SQLite WASM. Migration 2 adds media, import metadata, search documents, and the optional FTS5 virtual table; migration 3 adds people/source mappings, archive identity, media-cache metadata, participant IDs, and sender IDs; migration 4 adds social graph tables and profile facts; migration 5 adds the activity ledger; migration 6 adds archive sets, archive parts, and source-part references; migration 7 adds import sessions, per-part checkpoints, section status, rebuild jobs, and warning groups; migration 8 records each logical set/part's source format; migration 9 separates source/derived status, adds checkpointed derived-index jobs and large-archive query indexes while preserving earlier schemas. Query APIs expose explicit cursor pages so React never loads full record sets.
 
 During import, supported data is normalized and indexed into a local SQLite database.
 
@@ -233,7 +240,7 @@ Examples of indexed information include:
 
 SQLite FTS5 provides local full-text search for posts, messages, conversation titles, participants, and profiles. When a browser build cannot create FTS5, the same database worker falls back to a bounded SQL `LIKE` search over mirrored documents.
 
-Large media files remain associated with their original archive instead of unnecessarily being copied into the database. HTML is tokenized with parse5 from zip.js byte streams. The tokenizer pauses at 20,000 normalized records; the import worker coalesces those records into a bounded handoff of up to 100,000 records before waiting for SQLite, and SQLite writes use 2,000-row statement batches. Checkpoints are committed per ZIP part, while batch acknowledgements keep the in-flight normalized queue bounded.
+Large media files remain associated with their original archive instead of unnecessarily being copied into the database. HTML is tokenized with parse5 from zip.js byte streams. The tokenizer pauses at 5,000 normalized records; the import worker coalesces records into a bounded handoff of up to 5,000 records before waiting for SQLite, and SQLite writes use 2,000-row statement batches. Checkpoints are committed per ZIP part, while batch acknowledgements keep the in-flight normalized queue bounded. Search and activity indexes use the same 5,000-row checkpoint window and persist their row cursor for safe resume.
 
 ---
 
@@ -400,9 +407,9 @@ Each platform remains responsible for determining what information is included i
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
 
-## Recommended Milestone 10
+## Recommended Milestone 11
 
-Add the next layer of archive usability without changing the local-first boundary: clearer incremental-index progress and diagnostics, more tolerant HTML coverage for additional Facebook export variants, richer media metadata, and pagination/virtualization refinements where real-world archives need them. Keep all archive processing, search, diagnostics, and storage local. Multi-archive workspaces and export merging should remain out of scope until this single logical archive experience is mature.
+Extend the single-archive experience with broader relationship reconstruction: richer interaction aggregation on person pages, more Facebook HTML variants, and scalable graph-oriented browsing. Keep archive processing, search, diagnostics, and storage local. Multi-archive workspaces and export merging should remain out of scope until this single logical archive experience is mature.
 
 ---
 

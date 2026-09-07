@@ -7,11 +7,11 @@ import { FACEBOOK_PARSER_VERSION } from './version';
 
 /** HTML export parser limits. They keep malformed pages from becoming an
  * accidental unbounded-memory workload while preserving ordinary exports. */
-// A twenty-thousand-record acknowledgement keeps the parser responsive while
-// avoiding hundreds of thousands of worker round trips for large Messenger
-// exports. The queue is still bounded: records are released as soon as the
-// database acknowledges each batch, and text fields are individually capped.
-export const HTML_RECORD_BATCH_SIZE = 20_000;
+// A five-thousand-record acknowledgement was the best balance in the M10
+// synthetic/representative probes: structured-clone payloads stay bounded,
+// while the importer avoids a round trip for every HTML card. Records are
+// released as soon as the database acknowledges each batch.
+export const HTML_RECORD_BATCH_SIZE = 5_000;
 const MAX_TEXT = 100_000;
 const MAX_MEDIA_PER_RECORD = 100;
 const MAX_ALBUM_MEDIA_REFERENCES = 10_000;

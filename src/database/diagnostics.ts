@@ -31,6 +31,13 @@ const safeMetrics = (metrics?: ImportSession['metrics']) => metrics ? {
   partDurationsMs: Object.fromEntries(Object.values(metrics.partDurationsMs ?? {}).map((duration, index) => [`part-${index + 1}`, duration])),
   sectionCounts: metrics.sectionCounts ?? {},
   slowestSections: metrics.slowestSections ?? [],
+  stageDurationsMs: metrics.stageDurationsMs ?? {},
+  stageCounts: metrics.stageCounts ?? {},
+  batchSize: metrics.batchSize ?? null,
+  batchCount: metrics.batchCount ?? 0,
+  derivedDurationsMs: metrics.derivedDurationsMs ?? {},
+  derivedRows: metrics.derivedRows ?? {},
+  storageSnapshotBytes: metrics.storageSnapshotBytes ?? null,
 } : null;
 const safeShape = (value: string) => {
   const structural = new Set(['array', 'empty', 'null', 'object', 'string', 'number', 'boolean', 'undefined', 'about_me', 'account', 'account_information', 'albums', 'attachments', 'author', 'basic_information', 'body', 'content', 'conversation', 'created_at', 'data', 'display_name', 'entries', 'file_name', 'full_name', 'id', 'items', 'message', 'message_data', 'messages', 'messages_data', 'name', 'participants', 'path', 'personal_information', 'post', 'posts', 'posts_v2', 'profile', 'profile_information', 'profile_v2', 'sender', 'sender_name', 'text', 'thread', 'timestamp', 'title', 'uri', 'user_id', 'username']);

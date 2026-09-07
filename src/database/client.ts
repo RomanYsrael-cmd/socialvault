@@ -1,28 +1,30 @@
 import type { ActivityRecord, ActivityType, ArchiveCoverage, ArchiveIdentity, ArchivePart, Connection, ImportPartCheckpoint, ImportSession, Media, Message, NormalizedArchiveData, Person, Post, Profile } from '../archive/schemas/models';
-import type { AlbumDetail, AlbumSummary, ArchiveStats, ArchiveStatus, ConversationPreview, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchResponse, ConnectionSummary } from './types';
+import type { AlbumDetail, AlbumSummary, ArchiveStats, ArchiveStatus, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchResponse, ConnectionSummary } from './types';
 
 let worker: Worker | undefined;
 let sequence = 0;
 let ready: Promise<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }> | undefined;
-const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; progress?: (value: DatabaseProgress) => void }>();
 
-function call<T>(request: Omit<DatabaseRequest, 'id'>): Promise<T> {
+function call<T>(request: Omit<DatabaseRequest, 'id'>, progress?: (value: DatabaseProgress) => void): Promise<T> {
   if (!worker) {
     worker = new Worker(new URL('./database.worker.ts', import.meta.url), { type: 'module' });
     worker.onmessage = (event: MessageEvent<DatabaseResponse>) => {
+      if ((event.data as unknown as DatabaseProgress).type === 'progress') { const update = event.data as unknown as DatabaseProgress; pending.get(update.requestId)?.progress?.(update); return; }
       const promise = pending.get(event.data.id); if (!promise) return;
       pending.delete(event.data.id); event.data.ok ? promise.resolve(event.data.data) : promise.reject(new Error(event.data.error));
     };
     worker.onerror = event => { const message = event instanceof ErrorEvent ? event.message : 'Database worker stopped unexpectedly.'; pending.forEach(item => item.reject(new Error(message))); pending.clear(); ready = undefined; worker = undefined; };
   }
   const id = ++sequence;
-  return new Promise<T>((resolve, reject) => { pending.set(id, { resolve: resolve as never, reject }); worker!.postMessage({ ...request, id }); });
+  return new Promise<T>((resolve, reject) => { pending.set(id, { resolve: resolve as never, reject, progress }); worker!.postMessage({ ...request, id }); });
 }
 
 const emptyData = (): NormalizedArchiveData => ({ people: [], profileFacts: [], posts: [], comments: [], reactions: [], connections: [], albums: [], conversations: [], messages: [], media: [], warnings: [] });
 
 export const database = {
   init() { return ready ??= call<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }>({ type: 'init' }); },
+  storageStatus() { return this.init().then(() => call<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }>({ type: 'storage-status' })); },
   replace(data: NormalizedArchiveData) { return this.init().then(() => call<void>({ type: 'replace', data })); },
   importState(sessionId?: string) { return this.init().then(() => call<ImportState>({ type: 'import-state', sessionId })); },
   beginImport(session: ImportSession, parts: ArchivePart[], archiveSet?: NormalizedArchiveData['archiveSet'], archiveIdentity?: NormalizedArchiveData['archiveIdentity']) { return this.init().then(() => call<ImportState>({ type: 'begin-import', session, data: { ...emptyData(), archiveParts: parts, archiveSet, archiveIdentity } })); },
@@ -36,8 +38,8 @@ export const database = {
   failImportPart(sessionId: string, part: ArchivePart, errorMessage?: string) { return this.init().then(() => call<ImportPartCheckpoint>({ type: 'fail-import-part', sessionId, part, errorMessage })); },
   retryImportPart(sessionId: string, part: ArchivePart) { return this.init().then(() => call<ImportState>({ type: 'retry-import-part', sessionId, part })); },
   restartImport() { return this.init().then(() => call<void>({ type: 'restart-import' })); },
-  rebuildSearch() { return this.init().then(() => call<RebuildResult>({ type: 'rebuild-search' })); },
-  rebuildActivity() { return this.init().then(() => call<RebuildResult>({ type: 'rebuild-activity' })); },
+  rebuildSearch(progress?: (value: DatabaseProgress) => void, force = false) { return this.init().then(() => call<RebuildResult>({ type: 'rebuild-search', force }, progress)); },
+  rebuildActivity(progress?: (value: DatabaseProgress) => void, force = false) { return this.init().then(() => call<RebuildResult>({ type: 'rebuild-activity', force }, progress)); },
   coverage() { return this.init().then(() => call<ArchiveCoverage>({ type: 'coverage' })); },
   diagnostics() { return this.init().then(() => call<Record<string, unknown>>({ type: 'diagnostics' })); },
   profile() { return this.init().then(() => call<Profile | undefined>({ type: 'profile' })); },

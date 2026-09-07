@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=8;
+export const SCHEMA_VERSION=9;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -103,6 +103,27 @@ export const MIGRATIONS:readonly Migration[]=[
     `ALTER TABLE archive_sets ADD COLUMN source_format TEXT`,
     `ALTER TABLE archive_parts ADD COLUMN source_format TEXT`,
     `ALTER TABLE posts ADD COLUMN links TEXT NOT NULL DEFAULT '[]'`
+  ]},
+  {version:9,statements:[
+    // Milestone 10 keeps the original v1-v8 migrations immutable. These
+    // columns distinguish source import completion from derived-index work.
+    `ALTER TABLE import_sessions ADD COLUMN source_status TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_status TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_phase TEXT`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_rows INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_total INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_updated_at TEXT`,
+    `ALTER TABLE import_sessions ADD COLUMN derived_error TEXT`,
+    `CREATE TABLE IF NOT EXISTS derived_index_jobs (id TEXT NOT NULL, session_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', phase TEXT NOT NULL DEFAULT 'pending', cursor TEXT, rows_processed INTEGER NOT NULL DEFAULT 0, total_rows INTEGER NOT NULL DEFAULT 0, batch_size INTEGER NOT NULL DEFAULT 5000, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, error TEXT, PRIMARY KEY(session_id,kind), FOREIGN KEY(session_id) REFERENCES import_sessions(id))`,
+    `CREATE INDEX IF NOT EXISTS idx_derived_index_jobs_status ON derived_index_jobs(session_id,status,kind)`,
+    `CREATE INDEX IF NOT EXISTS idx_posts_created_id ON posts(created_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_conversation_sent_id ON messages(conversation_id,sent_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_sent_id ON messages(sent_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_comments_post_created_id ON comments(post_id,created_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_reactions_target_created_id ON reactions(target_type,target_id,created_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_activity_occurred_id ON activity_records(occurred_at DESC,id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_search_documents_created_id ON search_documents(created_at DESC,entity_id ASC)`,
+    `UPDATE import_sessions SET source_status=CASE WHEN status='complete' THEN 'complete' WHEN status IN ('importing','indexing') THEN 'importing' ELSE 'incomplete' END WHERE source_status='pending'`
   ]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

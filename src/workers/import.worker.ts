@@ -93,11 +93,10 @@ function aggregateDetection(inspected: InspectedPart[], duplicateNames: string[]
 }
 
 type PartBatchHandler = (data: NormalizedArchiveData) => Promise<void>;
-// The HTML tokenizer pauses at HTML_RECORD_BATCH_SIZE, but a part can still
-// coalesce several parser batches before crossing the worker/database boundary.
-// This keeps parser memory bounded while avoiding a SQLite transaction for every
-// small Messenger page. The queue is flushed on part completion or cancellation.
-const HTML_IMPORT_BATCH_SIZE = 100_000;
+// Keep the producer/consumer queue at the same bounded 5k target as the HTML
+// tokenizer. The database acknowledges each batch before parsing continues, so
+// a large Messenger part cannot accumulate 100k+ records in the worker.
+const HTML_IMPORT_BATCH_SIZE = 5_000;
 async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartBatchHandler, preferJsonSections: ReadonlySet<string> = new Set()): Promise<NormalizedArchiveData> {
   checkCancelled();
   let reader: ZipReader<Blob> | undefined;
@@ -137,6 +136,7 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
     // interrupts the part before its checkpoint is finalized.
     let pendingHtmlBatch = emptyNormalizedData();
     let pendingHtmlRecords = 0;
+    let importBatchCount = 0;
     const htmlBatchSize = (batch: NormalizedArchiveData) => batch.people.length + batch.posts.length + batch.comments.length + batch.reactions.length + batch.connections.length + batch.albums.length + batch.conversations.length + batch.messages.length + batch.media.length;
     const appendHtmlBatch = async (batch: NormalizedArchiveData) => {
       if (!onBatch) return;
@@ -145,10 +145,11 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
       pendingHtmlRecords += htmlBatchSize(normalized);
       if (pendingHtmlRecords >= HTML_IMPORT_BATCH_SIZE) {
         const next = pendingHtmlBatch; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0;
+        importBatchCount++;
         await onBatch(next);
       }
     };
-    const flushHtmlBatch = async () => { if (!onBatch || pendingHtmlRecords === 0) return; const next = pendingHtmlBatch; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0; await onBatch(next); };
+    const flushHtmlBatch = async () => { if (!onBatch || pendingHtmlRecords === 0) return; const next = pendingHtmlBatch; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0; importBatchCount++; await onBatch(next); };
     flushPendingHtml = flushHtmlBatch;
     for (let index = 0; index < candidates.length; index++) {
       checkCancelled();
@@ -221,7 +222,8 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
     // available in warningGroups/diagnostics.
     data.warnings = [...new Set(data.warnings)].slice(0, 200);
     data.diagnostics.warningGroups = data.warningGroups;
-    data.performance = { totalDurationMs: Math.round(performance.now() - startedAt), sectionCounts: Object.fromEntries(sectionCounts), slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs: Math.round(durationMs) })) };
+    const parseDurationMs = Math.round(performance.now() - startedAt);
+    data.performance = { totalDurationMs: parseDurationMs, sectionCounts: Object.fromEntries(sectionCounts), slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs: Math.round(durationMs) })), stageDurationsMs: { parsing: parseDurationMs }, stageCounts: { candidateFiles: candidates.length, normalizedRecords: data.diagnostics.htmlRecordCount ?? 0 }, batchSize: HTML_IMPORT_BATCH_SIZE, batchCount: importBatchCount };
     data.diagnostics.performance = data.performance;
     const unsupported = item.detection.unsupportedSections ?? [], imported = item.detection.sections.filter(section => !unsupported.includes(section));
     data.coverage = { detectedSections: item.detection.sections, importedSections: imported, partialSections: data.warnings.length ? imported : [], unsupportedSections: unsupported, malformedSections: [...malformedSections], skippedParts: [], sectionStatuses: item.detection.sections.map(section => ({ section, status: unsupported.includes(section) ? 'unsupported' as const : malformedSections.has(section) ? 'malformed' as const : data.warnings.length ? 'partial' as const : 'imported' as const, parserVersion: FACEBOOK_PARSER_VERSION })) };
@@ -241,6 +243,7 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
 }
 
 async function run(payload: ImportRunRequest) {
+  const runStartedAt = performance.now();
   const files = [...(payload.files ?? (payload.file ? [payload.file] : []))]; if (!files.length) throw new Error('Choose at least one ZIP file.');
   const inspected: InspectedPart[] = []; const duplicateNames: string[] = []; const fingerprints = new Set<string>();
   for (let index = 0; index < files.length; index++) {
@@ -269,6 +272,7 @@ async function run(payload: ImportRunRequest) {
   send({ type: 'progress', stage: 'identity', message: 'Created a local archive-set signature', completed: inspected.length, total: files.length });
   if (payload.action === 'inspect' || payload.action === 'verify') { send({ type: 'result', result: detection }); return; }
   if (!detection.supported) throw new Error('These ZIP files do not look like a supported Facebook Download Your Information archive.');
+  const inspectionDurationMs = performance.now() - runStartedAt;
   const completed = new Set(payload.completedPartIds ?? []), skipped = new Set(payload.skippedPartIds ?? []);
   const overallFormat = detection.format ?? 'unknown';
   const metadataOnlyPart = (item: InspectedPart) => item.detection.sections.length > 0 || item.entries.some(entry => { const path = cleanArchivePath(entry.filename).toLowerCase(); return path.startsWith('your_facebook_activity/') || path.startsWith('personal_information/') || path.startsWith('messages/') || path.startsWith('connections/'); });
@@ -301,10 +305,15 @@ async function run(payload: ImportRunRequest) {
     const leftMetrics = data.performance ?? {}; const rightMetrics = partData.performance ?? partData.diagnostics?.performance ?? {};
     const sectionCounts = { ...(leftMetrics.sectionCounts ?? {}) }; for (const [section, count] of Object.entries(rightMetrics.sectionCounts ?? {})) sectionCounts[section] = (sectionCounts[section] ?? 0) + count;
     const slowest = [...(leftMetrics.slowestSections ?? []), ...(rightMetrics.slowestSections ?? [])].sort((a, b) => b.durationMs - a.durationMs).slice(0, 5);
-    data.performance = { totalDurationMs: (leftMetrics.totalDurationMs ?? 0) + (rightMetrics.totalDurationMs ?? 0), sectionCounts, slowestSections: slowest }; data.diagnostics.performance = data.performance;
+     const stageDurationsMs = { ...(leftMetrics.stageDurationsMs ?? {}) };
+     for (const [stage, duration] of Object.entries(rightMetrics.stageDurationsMs ?? {})) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + duration;
+     const stageCounts = { ...(leftMetrics.stageCounts ?? {}) };
+     for (const [stage, count] of Object.entries(rightMetrics.stageCounts ?? {})) stageCounts[stage] = (stageCounts[stage] ?? 0) + count;
+     data.performance = { totalDurationMs: (leftMetrics.totalDurationMs ?? 0) + (rightMetrics.totalDurationMs ?? 0), sectionCounts, slowestSections: slowest, stageDurationsMs, stageCounts, batchSize: Math.max(leftMetrics.batchSize ?? 0, rightMetrics.batchSize ?? 0) || undefined, batchCount: (leftMetrics.batchCount ?? 0) + (rightMetrics.batchCount ?? 0) }; data.diagnostics.performance = data.performance;
     const leftCoverage = data.coverage, rightCoverage = partData.coverage;
     if (leftCoverage || rightCoverage) data.coverage = { detectedSections: [...new Set([...(leftCoverage?.detectedSections ?? []), ...(rightCoverage?.detectedSections ?? [])])], importedSections: [...new Set([...(leftCoverage?.importedSections ?? []), ...(rightCoverage?.importedSections ?? [])])], partialSections: [...new Set([...(leftCoverage?.partialSections ?? []), ...(rightCoverage?.partialSections ?? [])])], unsupportedSections: [...new Set([...(leftCoverage?.unsupportedSections ?? []), ...(rightCoverage?.unsupportedSections ?? [])])], malformedSections: [...new Set([...(leftCoverage?.malformedSections ?? []), ...(rightCoverage?.malformedSections ?? [])])], skippedParts: [...new Set([...(leftCoverage?.skippedParts ?? []), ...(rightCoverage?.skippedParts ?? [])])] };
   };
+  const parseStartedAt = performance.now();
   for (const item of parseable) {
     checkCancelled(); const archivePart = partByFingerprint.get(item.part.manifestFingerprint) ?? item.part; const parsedPart = { ...item, part: { ...item.part, ...archivePart, archiveId: archiveSetId(detection.archiveSetFingerprint ?? '') } }; const batchHandler: PartBatchHandler = async batch => {
       const batchAckId = `${payload.sessionId ?? 'import'}:${parsedPart.part.id}:batch:${Date.now()}:${Math.random().toString(16).slice(2)}`;
@@ -348,6 +357,22 @@ async function run(payload: ImportRunRequest) {
   for (const warning of detection.warnings) { const category = diagnosticWarningCategory(warning); const group = finalWarningGroups.get(category) ?? { message: warning.replace(/^.*?·\s*/, '').slice(0, 180), count: 0, sourcePaths: new Set<string>() }; group.count += 1; const source = warning.match(/·\s([^:]+):/)?.[1]; if (source) group.sourcePaths.add(cleanArchivePath(source)); finalWarningGroups.set(category, group); }
   data.warningGroups = [...finalWarningGroups.entries()].map(([category, group]) => ({ category, message: group.message, count: group.count, sourcePaths: [...group.sourcePaths].slice(0, 8) })); if (data.diagnostics) data.diagnostics.warningGroups = data.warningGroups;
   if (data.diagnostics) { data.diagnostics.detectedSections = detection.sections; data.diagnostics.unsupportedSections = detection.unsupportedSections ?? []; }
+  data.performance = {
+    ...(data.performance ?? {}),
+    stageDurationsMs: {
+      ...(data.performance?.stageDurationsMs ?? {}),
+      zipInspection: Math.round(inspectionDurationMs),
+      parsing: Math.round(performance.now() - parseStartedAt),
+      total: Math.round(performance.now() - runStartedAt),
+    },
+    stageCounts: {
+      ...(data.performance?.stageCounts ?? {}),
+      partsInspected: inspected.length,
+      partsParsed: parsedPartIds.size,
+      partsSkipped: skipped.size,
+    },
+  };
+  if (data.diagnostics) data.diagnostics.performance = data.performance;
   const unsupportedSections = detection.unsupportedSections ?? [];
   const malformedSections = [...new Set([...(data.coverage?.malformedSections ?? []), ...(failedParts.length ? detection.sections : [])])];
   const partialSections = [...new Set([...(data.coverage?.partialSections ?? []), ...(data.warnings.length ? data.importedSections : [])])];
