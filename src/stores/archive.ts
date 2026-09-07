@@ -1,13 +1,12 @@
 import { create } from 'zustand';
 import type { DetectionResult } from '../archive/detectors/types';
 import type { ArchiveIdentity, ArchivePart, ArchiveSet } from '../archive/schemas/models';
+import { archiveSourceRegistry, type ArchiveSourceDescriptor } from '../archive/source-registry';
 import { objectUrlCache } from '../media/object-url-cache';
 
-type FileRegistry = Record<string, File>;
 type State = {
-  /** First file is kept for older callers; media uses filesByPart. */
-  file?: File;
-  filesByPart: FileRegistry;
+  /** UI-safe source metadata. File objects and directory handles live only in the runtime registry. */
+  sourceDescriptors: ArchiveSourceDescriptor[];
   fileName?: string;
   fileSize?: number;
   result?: DetectionResult;
@@ -17,47 +16,50 @@ type State = {
   connectedPartIds: string[];
   imported: boolean;
   storageMode?: 'opfs' | 'indexeddb';
-  setArchive: (files: File | File[], result: DetectionResult, imported?: boolean) => void;
-  connectArchive: (files: File[], result: DetectionResult) => void;
+  setArchive: (result: DetectionResult, descriptors: ArchiveSourceDescriptor[], imported?: boolean) => void;
+  connectArchive: (result: DetectionResult, descriptors: ArchiveSourceDescriptor[]) => void;
   restoreArchive: (archiveSet: ArchiveSet | undefined, parts: ArchivePart[], identity?: ArchiveIdentity) => void;
   markImported: (mode: 'opfs' | 'indexeddb') => void;
   markImportIncomplete: () => void;
+  releaseSources: (partIds?: readonly string[]) => void;
   clear: () => void;
 };
 
-const asFiles = (files: File | File[]) => Array.isArray(files) ? files : [files];
-function partsFor(result: DetectionResult, files: File[]): ArchivePart[] {
+const sourceParts = (result: DetectionResult, descriptors: readonly ArchiveSourceDescriptor[]): ArchivePart[] => {
   if (result.parts?.length) return result.parts;
   const identity = result.identity;
-  if (!identity || !files[0]) return [];
-  return [{ id: `archive-part:${identity.fingerprint}`, archiveId: `archive-set:facebook:${identity.fingerprint}`, partIndex: 0, filename: files[0].name, fileSize: files[0].size, entryCount: identity.entryCount, manifestFingerprint: identity.fingerprint, connected: true, status: 'ready' }];
-}
-function registry(parts: ArchivePart[], files: File[]): FileRegistry {
-  const used = new Set<number>(); const entries: Array<[string, File]> = [];
-  parts.forEach((part, index) => {
-    const match = files.findIndex((file, fileIndex) => !used.has(fileIndex) && file.name === part.filename && file.size === part.fileSize);
-    const fileIndex = match;
-    if (fileIndex >= 0) { used.add(fileIndex); entries.push([part.id, files[fileIndex]]); }
-  });
-  return Object.fromEntries(entries);
-}
+  const source = descriptors[0];
+  if (!identity || !source) return [];
+  return [{ id: `archive-part:${identity.fingerprint}`, archiveId: `archive-set:facebook:${identity.fingerprint}`, partIndex: 0, filename: source.name, fileSize: identity.size, entryCount: identity.entryCount, manifestFingerprint: identity.fingerprint, connected: true, status: 'ready' }];
+};
+
+const archiveSetFor = (result: DetectionResult, parts: ArchivePart[], descriptors: readonly ArchiveSourceDescriptor[], status: ArchiveSet['status'] = 'complete'): ArchiveSet | undefined => {
+  if (!parts.length) return undefined;
+  const fingerprint = result.archiveSetFingerprint ?? parts[0].manifestFingerprint;
+  const totalSize = result.totalSize ?? descriptors.reduce((sum, source) => sum + source.size, 0);
+  return { id: `archive-set:facebook:${fingerprint}`, platform: 'facebook', createdAt: Date.now(), partCount: parts.length, totalSize, fingerprint, sourceFormat: result.format === 'mixed' ? 'mixed' : result.format === 'html' ? 'html' : result.format === 'json' ? 'json' : undefined, status };
+};
+
+const connectedFor = (parts: readonly ArchivePart[]) => parts.filter(part => part.status !== 'failed' && part.status !== 'duplicate' && archiveSourceRegistry.isAvailable(part.id)).map(part => part.id);
 
 export const useArchiveStore = create<State>(set => ({
-  filesByPart: {}, archiveParts: [], connectedPartIds: [], imported: false,
-  setArchive: (input, result, imported = false) => {
-    const files = asFiles(input); const parts = partsFor(result, files); const filesByPart = registry(parts, files);
-    objectUrlCache.clear(); set({ file: files[0], filesByPart, fileName: files.length > 1 ? `${files.length} ZIP parts` : files[0]?.name, fileSize: files.reduce((sum, file) => sum + file.size, 0), result, identity: result.identity, archiveSet: result.parts?.[0] ? { id: result.parts[0].archiveId, platform: 'facebook', createdAt: Date.now(), partCount: parts.length, totalSize: files.reduce((sum, file) => sum + file.size, 0), fingerprint: result.archiveSetFingerprint ?? result.parts?.[0].manifestFingerprint ?? '', sourceFormat: result.format === 'mixed' ? 'mixed' : result.format === 'html' ? 'html' : 'json', status: 'complete' } : undefined, archiveParts: parts, connectedPartIds: parts.filter(part => part.status !== 'failed' && part.status !== 'duplicate' && !!filesByPart[part.id]).map(part => part.id), imported });
+  sourceDescriptors: [], archiveParts: [], connectedPartIds: [], imported: false,
+  setArchive: (result, descriptors, imported = false) => {
+    const parts = sourceParts(result, descriptors);
+    archiveSourceRegistry.bindParts(parts);
+    objectUrlCache.clear();
+    set({ sourceDescriptors: [...descriptors], fileName: descriptors.length > 1 ? `${descriptors.length} ZIP parts` : descriptors[0]?.name, fileSize: result.totalSize ?? descriptors.reduce((sum, source) => sum + source.size, 0), result, identity: result.identity, archiveSet: archiveSetFor(result, parts, descriptors), archiveParts: parts, connectedPartIds: connectedFor(parts), imported });
   },
-  connectArchive: (files, result) => set(state => {
-    const parts = result.parts ?? []; const connected = registry(parts, files); const filesByPart = { ...state.filesByPart, ...connected }; const matchedPartIds = parts.filter(part => part.status !== 'failed' && part.status !== 'duplicate' && !!connected[part.id]).map(part => part.id); const connectedPartIds = [...new Set([...state.connectedPartIds, ...matchedPartIds])];
+  connectArchive: (result, descriptors) => set(state => {
+    const parts = result.parts ?? [];
+    archiveSourceRegistry.bindParts(parts);
+    const connectedPartIds = [...new Set([...state.connectedPartIds, ...connectedFor(parts)])];
     const archiveParts: ArchivePart[] = (state.archiveParts.length ? state.archiveParts : parts).map(part => connectedPartIds.includes(part.id) ? { ...part, connected: true, status: 'ready' as const } : part);
-    // Verification is a transient step. Keep the matched files and persisted part
-    // catalog, then return to the reconnect/resume view instead of treating the
-    // verification result as a newly opened archive.
-    return { filesByPart, connectedPartIds, result: undefined, identity: result.identity ?? state.identity, archiveSet: result.archiveSetFingerprint ? { id: `archive-set:facebook:${result.archiveSetFingerprint}`, platform: 'facebook' as const, createdAt: Date.now(), partCount: archiveParts.length, totalSize: result.totalSize ?? archiveParts.reduce((sum, item) => sum + item.fileSize, 0), fingerprint: result.archiveSetFingerprint, sourceFormat: result.format === 'mixed' ? 'mixed' : result.format === 'html' ? 'html' : 'json', status: 'incomplete' as const } : state.archiveSet, archiveParts };
+    return { sourceDescriptors: [...state.sourceDescriptors, ...descriptors.filter(candidate => !state.sourceDescriptors.some(existing => existing.key === candidate.key))], connectedPartIds, result: undefined, identity: result.identity ?? state.identity, archiveSet: state.archiveSet ?? (result.archiveSetFingerprint ? archiveSetFor(result, archiveParts, descriptors, 'incomplete') : undefined), archiveParts };
   }),
-  restoreArchive: (archiveSet, archiveParts, identity) => set({ archiveSet, archiveParts, identity, result: undefined, imported: archiveSet?.status === 'complete', file: undefined, filesByPart: {}, connectedPartIds: [] }),
+  restoreArchive: (archiveSet, archiveParts, identity) => set({ archiveSet, archiveParts, identity, result: undefined, sourceDescriptors: [], fileName: undefined, fileSize: undefined, imported: archiveSet?.status === 'complete', connectedPartIds: [] }),
   markImported: storageMode => set({ imported: true, storageMode }),
   markImportIncomplete: () => set({ imported: false }),
-  clear: () => { objectUrlCache.clear(); set({ file: undefined, filesByPart: {}, fileName: undefined, fileSize: undefined, result: undefined, identity: undefined, archiveSet: undefined, archiveParts: [], connectedPartIds: [], imported: false, storageMode: undefined }); },
+  releaseSources: partIds => { archiveSourceRegistry.releaseAll(partIds); set(state => ({ connectedPartIds: state.connectedPartIds.filter(id => archiveSourceRegistry.isAvailable(id)) })); },
+  clear: () => { objectUrlCache.clear(); archiveSourceRegistry.clear(); set({ sourceDescriptors: [], fileName: undefined, fileSize: undefined, result: undefined, identity: undefined, archiveSet: undefined, archiveParts: [], connectedPartIds: [], imported: false, storageMode: undefined }); },
 }));

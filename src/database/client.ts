@@ -1,9 +1,9 @@
 import type { ActivityRecord, ActivityType, ArchiveCoverage, ArchiveIdentity, ArchivePart, Connection, ImportPartCheckpoint, ImportSession, Media, Message, NormalizedArchiveData, Person, Post, Profile } from '../archive/schemas/models';
-import type { AlbumDetail, AlbumSummary, ArchiveStats, ArchiveStatus, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchResponse, ConnectionSummary } from './types';
+import type { AlbumDetail, AlbumSummary, ArchiveStats, ArchiveStatus, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchResponse, ConnectionSummary, StorageStatus } from './types';
 
 let worker: Worker | undefined;
 let sequence = 0;
-let ready: Promise<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }> | undefined;
+let ready: Promise<StorageStatus> | undefined;
 const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; progress?: (value: DatabaseProgress) => void }>();
 
 function call<T>(request: Omit<DatabaseRequest, 'id'>, progress?: (value: DatabaseProgress) => void): Promise<T> {
@@ -23,8 +23,8 @@ function call<T>(request: Omit<DatabaseRequest, 'id'>, progress?: (value: Databa
 const emptyData = (): NormalizedArchiveData => ({ people: [], profileFacts: [], posts: [], comments: [], reactions: [], connections: [], albums: [], conversations: [], messages: [], media: [], warnings: [] });
 
 export const database = {
-  init() { return ready ??= call<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }>({ type: 'init' }); },
-  storageStatus() { return this.init().then(() => call<{ mode: 'opfs' | 'indexeddb'; searchBackend: 'fts5' | 'like' }>({ type: 'storage-status' })); },
+  init() { return ready ??= call<StorageStatus>({ type: 'init' }); },
+  storageStatus() { return this.init().then(() => call<StorageStatus>({ type: 'storage-status' })); },
   replace(data: NormalizedArchiveData) { return this.init().then(() => call<void>({ type: 'replace', data })); },
   importState(sessionId?: string) { return this.init().then(() => call<ImportState>({ type: 'import-state', sessionId })); },
   beginImport(session: ImportSession, parts: ArchivePart[], archiveSet?: NormalizedArchiveData['archiveSet'], archiveIdentity?: NormalizedArchiveData['archiveIdentity']) { return this.init().then(() => call<ImportState>({ type: 'begin-import', session, data: { ...emptyData(), archiveParts: parts, archiveSet, archiveIdentity } })); },

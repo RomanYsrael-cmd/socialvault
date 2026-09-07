@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { discoverZipFiles } from './folder';
+import { discoverZipFiles, discoverZipSources } from './folder';
 
 const file = (name: string, size = 4) => new File([new Uint8Array(size)], name, { type: 'application/zip' });
 type Node = { kind: 'file' | 'directory'; name: string; getFile?: () => Promise<File>; entries?: () => AsyncIterableIterator<[string, Node]> };
@@ -30,5 +30,16 @@ describe('bounded folder ZIP discovery', () => {
     const result = await discoverZipFiles(directory('large', children));
     expect(result.files).toHaveLength(10_000);
     expect(result.truncated).toBe(true);
+  });
+
+  it('enumerates ZIP handles without materializing file bytes', async () => {
+    let reads = 0;
+    const lazy: Node = { kind: 'file', name: 'lazy.zip', getFile: async () => { reads++; return file('lazy.zip', 12); } };
+    const result = await discoverZipSources(directory('export', { 'lazy.zip': lazy }));
+    expect(result.files).toHaveLength(0);
+    expect(result.sources).toHaveLength(1);
+    expect(reads).toBe(0);
+    await result.sources?.[0].handle?.getFile();
+    expect(reads).toBe(1);
   });
 });

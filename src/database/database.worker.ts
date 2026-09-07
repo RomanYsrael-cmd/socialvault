@@ -3,7 +3,7 @@ import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { clearFallbackImportState, getFallback, getFallbackImportState, getFallbackSnapshot, putFallback, putFallbackImportState, putFallbackSnapshot } from './indexeddb-fallback';
 import { FTS5_SCHEMA, MIGRATIONS, SCHEMA_VERSION } from './schema';
 import { archivePartId, archiveSetFingerprint, archiveSetId, mergeNormalizedData } from '../archive/archive-set';
-import type { AlbumSummary, ArchiveStats, ConnectionSummary, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchBackend, SearchResponse, SearchResult, StorageMode } from './types';
+import type { AlbumSummary, ArchiveStats, ConnectionSummary, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchBackend, SearchResponse, SearchResult, StorageMode, StorageStatus } from './types';
 import type { ActivityRecord, ActivityType, Album, ArchiveCoverage, ArchiveIdentity, ArchivePart, ArchiveSet, Comment, Connection, Conversation, DerivedIndexState, DerivedIndexStatus, ImportCounts, ImportDiagnostics, ImportPartCheckpoint, ImportSectionStatus, ImportSession, Media, Message, NormalizedArchiveData, Person, Post, Profile, ProfileFact, Reaction } from '../archive/schemas/models';
 import { FACEBOOK_PARSER_VERSION } from '../archive/adapters/version';
 import { createDiagnosticsReport } from './diagnostics';
@@ -13,6 +13,7 @@ let db: DB;
 let sqliteRuntime: any;
 let mode: StorageMode = 'indexeddb';
 let searchBackend: SearchBackend = 'like';
+let storageFallbackReason: string | undefined;
 let fallbackData: NormalizedArchiveData | undefined;
 let batchesSinceFallback = 0;
 let derivedBatchesSinceFallback = 0;
@@ -27,6 +28,14 @@ let fallbackSnapshotRequested = false;
 const send = (message: DatabaseResponse | DatabaseProgress) => postMessage(message);
 const sendDerivedProgress = (requestId: number, kind: 'search' | 'activity', phase: string, status: DatabaseProgress['status'], rowsProcessed: number, totalRows: number, message: string) => postMessage({ type: 'progress', requestId, kind, phase, status, rowsProcessed, totalRows, message } satisfies DatabaseProgress);
 const rows = (sql: string, bind: unknown[] = []): Record<string, unknown>[] => db.exec({ sql, bind, returnValue: 'resultRows', rowMode: 'object' } as Record<string, unknown>) as Record<string, unknown>[];
+function databaseSizeBytes() {
+  try {
+    const pageCount = Number(rows('PRAGMA page_count')[0]?.page_count ?? 0);
+    const pageSize = Number(rows('PRAGMA page_size')[0]?.page_size ?? 0);
+    const bytes = pageCount * pageSize;
+    return Number.isFinite(bytes) && bytes > 0 ? bytes : undefined;
+  } catch { return undefined; }
+}
 /** Keep the original SQLite/storage error if SQLite has already rolled back
  * internally (for example after SQLITE_FULL or SQLITE_NOMEM). The oo1
  * convenience wrapper attempts a second rollback in that case and masks the
@@ -52,7 +61,7 @@ function switchToIndexedDbFallback(preserve = true) {
     let memory: DB | undefined;
     try {
       memory = new sqliteRuntime.oo1.DB(':memory:', 'c') as DB;
-      db = memory; mode = 'indexeddb';
+      db = memory; mode = 'indexeddb'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.';
       // The fresh connection does not contain the OPFS schema. Initialize it
       // before the caller starts writing import checkpoints or normalized rows.
       applyMigrations(); setupSearch();
@@ -71,7 +80,7 @@ function switchToIndexedDbFallback(preserve = true) {
   // connection alive and surface the storage error to the caller.
   if (!snapshot?.byteLength || !deserializeSnapshot(memory, snapshot)) { try { memory.close?.(); } catch { /* ignore cleanup failure */ } return false; }
   try { previous.close?.(); } catch { /* preserve the readable in-memory copy */ }
-  db = memory; mode = 'indexeddb'; batchesSinceFallback = 0; derivedBatchesSinceFallback = 0;
+  db = memory; mode = 'indexeddb'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.'; batchesSinceFallback = 0; derivedBatchesSinceFallback = 0;
   return true;
 }
 async function withStorageFallback<T>(work: () => T | Promise<T>): Promise<T> {
@@ -94,19 +103,6 @@ let sqliteBatchSize = SQLITE_BATCH_SIZE;
  * records keeps structured-clone payloads small while avoiding one SQLite
  * transaction per HTML card. Derived SQL jobs use the same upper bound. */
 const DERIVED_BATCH_SIZE = 5000;
-// A multi-gigabyte Facebook ZIP set can exceed the browser's OPFS quota even
-// when the normalized SQLite file is still healthy. Choose the durable
-// IndexedDB/memory path before the first large write so a later OPFS failure
-// never requires exporting and deserializing a full archive-sized database.
-const LARGE_ARCHIVE_OPFS_THRESHOLD = 2 * 1024 * 1024 * 1024;
-const preferIndexedDbForArchive = (archiveSet?: ArchiveSet) => {
-  if (mode !== 'opfs' || !archiveSet || archiveSet.totalSize < LARGE_ARCHIVE_OPFS_THRESHOLD) return false;
-  // A fresh import has no source rows to preserve. Avoid an unnecessary
-  // OPFS export/deserialization at the handoff point; resumptions still copy
-  // the existing database so completed parts remain intact.
-  const hasSourceRows = Number(rows('SELECT (SELECT COUNT(*) FROM profiles)+(SELECT COUNT(*) FROM posts)+(SELECT COUNT(*) FROM messages) count')[0]?.count ?? 0) > 0;
-  return switchToIndexedDbFallback(hasSourceRows);
-};
 /** Keep SQLite writes bounded while avoiding one worker round-trip per record.
  * 2000 rows stays below SQLite's default variable limit even for the widest
  * normalized table (15 columns) while making large HTML imports materially
@@ -285,7 +281,6 @@ function replace(input: NormalizedArchiveData) {
   const parts = data.archiveParts?.length ? data.archiveParts : fallbackPart ? [fallbackPart] : [];
   const fallbackFingerprint = parts.length ? archiveSetFingerprint(parts) : undefined;
   const archiveSet = data.archiveSet ?? (parts.length && fallbackFingerprint ? { id: archiveSetId(fallbackFingerprint), platform: 'facebook' as const, createdAt: Date.now(), partCount: parts.length, totalSize: parts.reduce((sum, part) => sum + part.fileSize, 0), fingerprint: fallbackFingerprint, status: 'complete' as const } : undefined);
-  preferIndexedDbForArchive(archiveSet);
   const partIdFor = (source: { archivePartId?: string }) => source.archivePartId ?? parts[0]?.id ?? null;
   transaction(() => {
     ['activity_records', 'comments', 'reactions', 'album_media', 'albums', 'profile_facts', 'messages', 'conversations', 'posts', 'profiles', 'media', 'people', 'person_sources', 'source_records', 'import_metadata', 'archive_identity', 'archive_parts', 'archive_sets', 'import_part_checkpoints', 'import_section_status', 'diagnostic_warning_groups', 'derived_index_jobs', 'import_sessions', 'rebuild_jobs'].forEach(table => db.exec(`DELETE FROM ${table}`));
@@ -474,7 +469,7 @@ function importPartData(dataInput: NormalizedArchiveData, part: ArchivePart, ses
     const previousMetrics = state.session.metrics ?? {}; const partDuration = data.performance?.totalDurationMs ?? data.diagnostics?.performance?.totalDurationMs; const sectionCounts = { ...(previousMetrics.sectionCounts ?? {}) }; for (const [section, value] of Object.entries(data.performance?.sectionCounts ?? {})) sectionCounts[section] = (sectionCounts[section] ?? 0) + value;
     const stageDurationsMs = { ...(previousMetrics.stageDurationsMs ?? {}), database: Math.round((previousMetrics.stageDurationsMs?.database ?? 0) + databaseWriteDurationMs) };
     const stageCounts = { ...(previousMetrics.stageCounts ?? {}), databaseBatches: (previousMetrics.stageCounts?.databaseBatches ?? 0) + databaseWriteBatchCount };
-    upsertSession({ ...state.session, updatedAt: now, currentStage: 'parsing', status: 'importing', importedPartCount: checkpoints.filter(item => item.status === 'complete').length, failedPartCount: failed.length, skippedPartCount: skipped.length, normalizedCounts: counts, warningsCount: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), failedPartIds: failed.map(item => item.archivePartId), skippedPartIds: skipped.map(item => item.archivePartId), sourceStatus: 'importing', derivedStatus: 'pending', derivedPhase: undefined, derivedRows: 0, derivedTotal: 0, derivedUpdatedAt: now, derivedError: undefined, metrics: { ...previousMetrics, totalDurationMs: (previousMetrics.totalDurationMs ?? 0) + (partDuration ?? 0), partDurationsMs: { ...(previousMetrics.partDurationsMs ?? {}), [part.id]: partDuration ?? 0 }, sectionCounts, stageDurationsMs, stageCounts, batchSize: Math.max(previousMetrics.batchSize ?? 0, data.performance?.batchSize ?? 0) || undefined, batchCount: (previousMetrics.batchCount ?? 0) + (data.performance?.batchCount ?? 0) } });
+    upsertSession({ ...state.session, updatedAt: now, currentStage: 'parsing', status: 'importing', importedPartCount: checkpoints.filter(item => item.status === 'complete').length, failedPartCount: failed.length, skippedPartCount: skipped.length, normalizedCounts: counts, warningsCount: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), failedPartIds: failed.map(item => item.archivePartId), skippedPartIds: skipped.map(item => item.archivePartId), sourceStatus: 'importing', derivedStatus: 'pending', derivedPhase: undefined, derivedRows: 0, derivedTotal: 0, derivedUpdatedAt: now, derivedError: undefined, metrics: { ...previousMetrics, totalDurationMs: (previousMetrics.totalDurationMs ?? 0) + (partDuration ?? 0), partDurationsMs: { ...(previousMetrics.partDurationsMs ?? {}), [part.id]: partDuration ?? 0 }, sectionCounts, stageDurationsMs, stageCounts, batchSize: Math.max(previousMetrics.batchSize ?? 0, data.performance?.batchSize ?? 0) || undefined, batchCount: (previousMetrics.batchCount ?? 0) + (data.performance?.batchCount ?? 0), maxBatchRecords: Math.max(previousMetrics.maxBatchRecords ?? 0, data.performance?.maxBatchRecords ?? 0) || undefined, maxBatchBytes: Math.max(previousMetrics.maxBatchBytes ?? 0, data.performance?.maxBatchBytes ?? 0) || undefined } });
     databaseWriteDurationMs = 0;
     databaseWriteBatchCount = 0;
   }
@@ -767,7 +762,7 @@ function diagnosticsFromDatabase() {
   const state = currentImportState(); const statsValue = stats();
   const warningGroups = rows('SELECT category,message,occurrence_count occurrenceCount,source_paths sourcePaths FROM diagnostic_warning_groups WHERE session_id=? ORDER BY occurrence_count DESC,category', [state.session?.id ?? '']).map(row => ({ category: String(row.category), message: String(row.message), count: Number(row.occurrenceCount ?? 0), sourcePaths: json<string[]>(row.sourcePaths, []) }));
   const diagnostics = statsValue.diagnostics ? { ...statsValue.diagnostics, warningGroups: warningGroups.length ? warningGroups : statsValue.diagnostics.warningGroups } : undefined;
-  return createDiagnosticsReport({ parserVersion: state.session?.parserVersion ?? FACEBOOK_PARSER_VERSION, schemaVersion: SCHEMA_VERSION, archiveParts: statsValue.archiveParts, session: state.session, coverage: coverageFromDatabase(), diagnostics, warnings: statsValue.warnings });
+  return createDiagnosticsReport({ parserVersion: state.session?.parserVersion ?? FACEBOOK_PARSER_VERSION, schemaVersion: SCHEMA_VERSION, archiveParts: statsValue.archiveParts, session: state.session, coverage: coverageFromDatabase(), diagnostics, warnings: statsValue.warnings, storageMode: mode, storageFallbackReason, databaseSizeBytes: databaseSizeBytes() });
 }
 function requestFallbackSnapshot() {
   if (mode !== 'indexeddb') return;
@@ -1025,9 +1020,9 @@ async function init() {
   const sqlite3 = await sqlite3InitModule(); sqliteRuntime = sqlite3;
   let savedSnapshot: Uint8Array | undefined; let savedLegacy: NormalizedArchiveData | undefined; let savedState: ImportState | undefined;
   if (sqlite3.oo1.OpfsDb) {
-    try { const OpfsDb = sqlite3.oo1.OpfsDb as unknown as new (filename: string, flags: string) => DB; db = new OpfsDb('/socialvault.sqlite3', 'c'); mode = 'opfs'; }
-    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; }
-  } else db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB;
+    try { const OpfsDb = sqlite3.oo1.OpfsDb as unknown as new (filename: string, flags: string) => DB; db = new OpfsDb('/socialvault.sqlite3', 'c'); mode = 'opfs'; storageFallbackReason = undefined; }
+    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; storageFallbackReason = 'OPFS is unavailable in this browser context; using an IndexedDB snapshot fallback.'; }
+  } else { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; storageFallbackReason = 'This browser does not provide SQLite OPFS; using an IndexedDB snapshot fallback.'; }
   if (mode === 'indexeddb') { try { savedSnapshot = await getFallbackSnapshot(); if (!savedSnapshot) savedLegacy = await getFallback(); savedState = await getFallbackImportState(); } catch { /* in-memory SQLite remains usable when IndexedDB is unavailable or corrupt */ } }
   if (savedSnapshot && sqliteRuntime?.capi?.sqlite3_deserialize && db.pointer) {
     try { const pointer = sqliteRuntime.wasm.allocFromTypedArray(savedSnapshot); const flags = sqliteRuntime.capi.SQLITE_DESERIALIZE_RESIZEABLE | sqliteRuntime.capi.SQLITE_DESERIALIZE_FREEONCLOSE; const rc = sqliteRuntime.capi.sqlite3_deserialize(db.pointer, 'main', pointer, savedSnapshot.byteLength, savedSnapshot.byteLength, flags); if (rc !== 0) savedSnapshot = undefined; } catch { savedSnapshot = undefined; }
@@ -1044,17 +1039,17 @@ async function init() {
   if (legacySession?.sourceStatus === 'complete' && legacySession.derivedStatus !== 'complete' && legacySourceRows > 0 && !rows('SELECT 1 FROM derived_index_jobs LIMIT 1').length) {
     try { rebuildSearchFromDatabase(); rebuildActivityIndex(); updateImportSession(legacySession.id, { sourceStatus: 'complete', derivedStatus: 'complete', derivedPhase: 'complete', derivedRows: Number(rows('SELECT COUNT(*) count FROM activity_records')[0]?.count ?? 0), derivedTotal: Number(rows('SELECT COUNT(*) count FROM activity_records')[0]?.count ?? 0), currentStage: 'complete', status: 'complete' }); } catch { /* old data remains browsable even if a legacy rebuild is not possible */ }
   }
-  return { mode, searchBackend };
+  return { mode, searchBackend, reason: storageFallbackReason, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus;
 }
 
 self.onmessage = async (event: MessageEvent<DatabaseRequest>) => {
   const request = event.data;
   try {
     if (request.type === 'init') { send({ id: request.id, ok: true, data: await init() }); return; }
-    if (request.type === 'storage-status') { send({ id: request.id, ok: true, data: { mode, searchBackend } }); return; }
+    if (request.type === 'storage-status') { send({ id: request.id, ok: true, data: { mode, searchBackend, reason: storageFallbackReason, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus }); return; }
     if (request.type === 'replace' && request.data) { await withStorageFallback(() => replace(request.data!)); await persistFallback(); send({ id: request.id, ok: true }); return; }
     if (request.type === 'import-state') { send({ id: request.id, ok: true, data: currentImportState(request.sessionId) }); return; }
-    if (request.type === 'begin-import') { preferIndexedDbForArchive(request.data?.archiveSet); const state = await withStorageFallback(() => beginImportSession(request.session, request.data?.archiveParts ?? [], request.data?.archiveSet, request.data?.archiveIdentity)); await persistFallback(); send({ id: request.id, ok: true, data: state }); return; }
+    if (request.type === 'begin-import') { const state = await withStorageFallback(() => beginImportSession(request.session, request.data?.archiveParts ?? [], request.data?.archiveSet, request.data?.archiveIdentity)); await persistFallback(); send({ id: request.id, ok: true, data: state }); return; }
     if (request.type === 'import-batch' && request.data && request.part && request.sessionId) { const checkpoint = await withStorageFallback(() => importBatchData(request.data!, request.part!, request.sessionId!)); batchesSinceFallback++; if (batchesSinceFallback >= 256) { batchesSinceFallback = 0; await persistFallback(false); } send({ id: request.id, ok: true, data: checkpoint }); return; }
     if (request.type === 'import-part' && request.data && request.part && request.sessionId) { const checkpoint = await withStorageFallback(() => importPartData(request.data!, request.part!, request.sessionId!)); batchesSinceFallback = 0; await persistFallback(true); send({ id: request.id, ok: true, data: checkpoint }); return; }
     if (request.type === 'update-media-sources' && request.data) { await withStorageFallback(() => transaction(() => request.data!.media.forEach(item => db.exec({ sql: 'UPDATE media SET archive_part_id=? WHERE id=?', bind: [item.source.archivePartId ?? null, item.id] })))); await persistFallback(false); send({ id: request.id, ok: true }); return; }

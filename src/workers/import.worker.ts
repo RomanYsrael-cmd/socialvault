@@ -4,7 +4,7 @@ import { detectArchive } from '../archive/detectors';
 import { compareFacebookChunkPaths, diagnosticWarningCategory, emptyNormalizedData, findUnsafeMediaReferences, parseFacebookAlbumsWithMedia, parseFacebookComments, parseFacebookConnections, parseFacebookConversationWithMedia, parseFacebookPostsWithMedia, parseFacebookProfile, parseFacebookReactions, personFromProfile, shapeSignature } from '../archive/adapters/facebook-parser';
 import { FACEBOOK_PARSER_VERSION } from '../archive/adapters/version';
 import { HTML_RECORD_BATCH_SIZE, parseFacebookHtmlEntry } from '../archive/adapters/facebook-html-adapter';
-import { attributeArchivePart, archiveSetFingerprint, archiveSetId, cleanArchivePath, makeArchivePart, type ManifestEntry } from '../archive/archive-set';
+import { attributeArchivePart, archiveSetFingerprint, archiveSetId, cleanArchivePath, makeArchivePart, manifestFingerprint, type ManifestEntry } from '../archive/archive-set';
 import { isSuspiciousPath } from '../archive/security';
 import type { DetectionResult } from '../archive/detectors/types';
 import type { ArchivePart, ArchiveSet, NormalizedArchiveData, Person } from '../archive/schemas/models';
@@ -28,7 +28,7 @@ const hash = (value: string) => {
   for (let index = 0; index < value.length; index++) { result ^= value.charCodeAt(index); result = Math.imul(result, 16777619); }
   return (result >>> 0).toString(16).padStart(8, '0');
 };
-const identityFor = (file: File, entries: ManifestEntry[]) => ({ filename: file.name, size: file.size, entryCount: entries.length, fingerprint: hash(entries.filter(entry => !entry.directory).map(entry => `${cleanArchivePath(entry.filename)}:${entry.uncompressedSize ?? 0}:${entry.compressedSize ?? 0}`).sort().join('|')), knownEntries: entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename)).sort().slice(0, 80) });
+const identityFor = (file: File, entries: ManifestEntry[]) => ({ filename: file.name, size: file.size, entryCount: entries.length, fingerprint: manifestFingerprint(entries), knownEntries: entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename)).sort().slice(0, 80) });
 
 let cancelled = false;
 type PartAckResult = 'ok' | 'failed' | 'cancelled';
@@ -48,7 +48,7 @@ function addPerson(map: Map<string, Person>, person: Person, sourcePath?: string
 }
 
 type InspectedPart = { file: File; entries: ManifestEntry[]; detection: DetectionResult; part: ArchivePart };
-type ImportRunRequest = Extract<ImportRequest, { action: 'inspect' | 'import' | 'verify' | 'cancel' }>;
+type ImportRunRequest = Exclude<ImportRequest, { action: 'part-ack' | 'batch-ack' }>;
 async function inspectPart(file: File, partIndex: number, total: number): Promise<InspectedPart> {
   checkCancelled();
   send({ type: 'progress', stage: 'opening', message: `Opening ${file.name}…`, partIndex: partIndex + 1, partCount: total });
@@ -97,6 +97,22 @@ type PartBatchHandler = (data: NormalizedArchiveData) => Promise<void>;
 // tokenizer. The database acknowledges each batch before parsing continues, so
 // a large Messenger part cannot accumulate 100k+ records in the worker.
 const HTML_IMPORT_BATCH_SIZE = 5_000;
+const HTML_IMPORT_BATCH_BYTES = 8 * 1024 * 1024;
+const estimateTextBytes = (value: unknown) => typeof value === 'string' ? value.length * 2 : 0;
+const estimateNormalizedBytes = (batch: NormalizedArchiveData) => {
+  let bytes = 0;
+  const add = (value: unknown) => { bytes += estimateTextBytes(value); };
+  batch.people.forEach(person => { add(person.displayName); add(person.username); add(person.profileUrl); });
+  batch.posts.forEach(post => { add(post.text); add(post.title); add(post.authorName); });
+  batch.comments.forEach(comment => { add(comment.text); add(comment.authorName); });
+  batch.reactions.forEach(reaction => { add(reaction.personName); add(reaction.kind); });
+  batch.connections.forEach(connection => { add(connection.displayName); add(connection.username); });
+  batch.albums.forEach(album => { add(album.title); add(album.description); });
+  batch.conversations.forEach(conversation => { add(conversation.title); conversation.participantNames.forEach(add); });
+  batch.messages.forEach(message => { add(message.text); add(message.senderName); });
+  batch.media.forEach(media => { add(media.path); add(media.filename); add(media.caption); });
+  return bytes + (batch.people.length + batch.posts.length + batch.comments.length + batch.reactions.length + batch.connections.length + batch.albums.length + batch.conversations.length + batch.messages.length + batch.media.length) * 96;
+};
 async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartBatchHandler, preferJsonSections: ReadonlySet<string> = new Set()): Promise<NormalizedArchiveData> {
   checkCancelled();
   let reader: ZipReader<Blob> | undefined;
@@ -136,20 +152,44 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
     // interrupts the part before its checkpoint is finalized.
     let pendingHtmlBatch = emptyNormalizedData();
     let pendingHtmlRecords = 0;
+    let pendingHtmlBytes = 0;
     let importBatchCount = 0;
+    let maxBatchRecords = 0;
+    let maxBatchBytes = 0;
     const htmlBatchSize = (batch: NormalizedArchiveData) => batch.people.length + batch.posts.length + batch.comments.length + batch.reactions.length + batch.connections.length + batch.albums.length + batch.conversations.length + batch.messages.length + batch.media.length;
+    const collectPeople = () => {
+      for (const conversation of data.conversations) conversation.participantNames.forEach((displayName, index) => addPerson(people, { id: conversation.participantIds[index] ?? `person:messenger:${conversation.id}:${index}`, displayName, identityConfidence: 'inferred', identitySource: conversation.source.path, sourcePaths: [conversation.source.path] }, conversation.source.path));
+      for (const message of data.messages) if (message.senderId && message.senderName) addPerson(people, { id: message.senderId, displayName: message.senderName, firstSeen: message.sentAt, lastSeen: message.sentAt, identityConfidence: 'inferred', identitySource: message.source.path, sourcePaths: [message.source.path] }, message.source.path);
+      for (const post of data.posts) if (post.authorId) addPerson(people, { id: post.authorId, displayName: data.profile?.displayName ?? 'Archive owner', firstSeen: post.createdAt, lastSeen: post.createdAt, identityConfidence: post.authorId === 'owner' ? 'exact' : 'inferred', identitySource: post.source.path, sourcePaths: [post.source.path], isArchiveOwner: post.authorId === 'owner' }, post.source.path);
+      for (const comment of data.comments) if (comment.authorId && comment.authorName) addPerson(people, { id: comment.authorId, displayName: comment.authorName, firstSeen: comment.createdAt, lastSeen: comment.createdAt, identityConfidence: comment.authorId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: comment.source.path, sourcePaths: [comment.source.path] }, comment.source.path);
+      for (const reaction of data.reactions) if (reaction.personId && reaction.personName) addPerson(people, { id: reaction.personId, displayName: reaction.personName, firstSeen: reaction.createdAt, lastSeen: reaction.createdAt, identityConfidence: reaction.personId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: reaction.source.path, sourcePaths: [reaction.source.path] }, reaction.source.path);
+    };
+    const flushJsonBatch = async (force = false, includePeople = false) => {
+      if (!onBatch) return;
+      const records = htmlBatchSize(data), bytes = estimateNormalizedBytes(data);
+      if (!records && !includePeople) return;
+      if (!force && records < HTML_IMPORT_BATCH_SIZE && bytes < HTML_IMPORT_BATCH_BYTES) return;
+      collectPeople();
+      const next = attributeArchivePart({ ...emptyNormalizedData(), people: includePeople ? [...people.values()] : [], profileFacts: data.profileFacts.splice(0), posts: data.posts.splice(0), comments: data.comments.splice(0), reactions: data.reactions.splice(0), connections: data.connections.splice(0), albums: data.albums.splice(0), conversations: data.conversations.splice(0), messages: data.messages.splice(0), media: data.media.splice(0) }, item.part.id);
+      const nextRecords = htmlBatchSize(next), nextBytes = estimateNormalizedBytes(next);
+      maxBatchRecords = Math.max(maxBatchRecords, nextRecords); maxBatchBytes = Math.max(maxBatchBytes, nextBytes); importBatchCount++;
+      await onBatch(next);
+      if (includePeople) people.clear();
+    };
     const appendHtmlBatch = async (batch: NormalizedArchiveData) => {
       if (!onBatch) return;
       const normalized = attributeArchivePart(batch, item.part.id);
       pendingHtmlBatch.people.push(...normalized.people); pendingHtmlBatch.profileFacts.push(...normalized.profileFacts); pendingHtmlBatch.posts.push(...normalized.posts); pendingHtmlBatch.comments.push(...normalized.comments); pendingHtmlBatch.reactions.push(...normalized.reactions); pendingHtmlBatch.connections.push(...normalized.connections); pendingHtmlBatch.albums.push(...normalized.albums); pendingHtmlBatch.conversations.push(...normalized.conversations); pendingHtmlBatch.messages.push(...normalized.messages); pendingHtmlBatch.media.push(...normalized.media); pendingHtmlBatch.warnings.push(...normalized.warnings);
       pendingHtmlRecords += htmlBatchSize(normalized);
-      if (pendingHtmlRecords >= HTML_IMPORT_BATCH_SIZE) {
-        const next = pendingHtmlBatch; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0;
+      pendingHtmlBytes += estimateNormalizedBytes(normalized);
+      if (pendingHtmlRecords >= HTML_IMPORT_BATCH_SIZE || pendingHtmlBytes >= HTML_IMPORT_BATCH_BYTES) {
+        const next = pendingHtmlBatch; const nextRecords = pendingHtmlRecords; const nextBytes = pendingHtmlBytes; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0; pendingHtmlBytes = 0;
+        maxBatchRecords = Math.max(maxBatchRecords, nextRecords); maxBatchBytes = Math.max(maxBatchBytes, nextBytes);
         importBatchCount++;
         await onBatch(next);
       }
     };
-    const flushHtmlBatch = async () => { if (!onBatch || pendingHtmlRecords === 0) return; const next = pendingHtmlBatch; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0; importBatchCount++; await onBatch(next); };
+    const flushHtmlBatch = async () => { if (!onBatch || pendingHtmlRecords === 0) return; const next = pendingHtmlBatch; const nextRecords = pendingHtmlRecords; const nextBytes = pendingHtmlBytes; pendingHtmlBatch = emptyNormalizedData(); pendingHtmlRecords = 0; pendingHtmlBytes = 0; maxBatchRecords = Math.max(maxBatchRecords, nextRecords); maxBatchBytes = Math.max(maxBatchBytes, nextBytes); importBatchCount++; await onBatch(next); };
     flushPendingHtml = flushHtmlBatch;
     for (let index = 0; index < candidates.length; index++) {
       checkCancelled();
@@ -200,14 +240,13 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
         if (!recognized) { data.diagnostics.unsupportedCandidates++; data.warnings.push(`${item.file.name} · ${entry.filename}: unsupported ${section} JSON shape (skipped).`); data.diagnostics.shapeSignatures?.push(`${path} → ${shapeSignature(raw)}`); }
       } catch (error) { malformedSections.add(section); data.diagnostics.malformedFiles++; data.warnings.push(`${item.file.name} · ${entry.filename}: ${error instanceof Error ? error.message : 'Unsupported JSON'}`); }
       sectionDurations.set(section, (sectionDurations.get(section) ?? 0) + performance.now() - sectionStartedAt);
+      await flushJsonBatch();
     }
     await flushHtmlBatch();
-    for (const conversation of data.conversations) conversation.participantNames.forEach((displayName, index) => addPerson(people, { id: conversation.participantIds[index] ?? `person:messenger:${conversation.id}:${index}`, displayName, identityConfidence: 'inferred', identitySource: conversation.source.path, sourcePaths: [conversation.source.path] }, conversation.source.path));
-    for (const message of data.messages) if (message.senderId && message.senderName) addPerson(people, { id: message.senderId, displayName: message.senderName, firstSeen: message.sentAt, lastSeen: message.sentAt, identityConfidence: 'inferred', identitySource: message.source.path, sourcePaths: [message.source.path] }, message.source.path);
-    for (const post of data.posts) if (post.authorId) addPerson(people, { id: post.authorId, displayName: data.profile?.displayName ?? 'Archive owner', firstSeen: post.createdAt, lastSeen: post.createdAt, identityConfidence: post.authorId === 'owner' ? 'exact' : 'inferred', identitySource: post.source.path, sourcePaths: [post.source.path], isArchiveOwner: post.authorId === 'owner' }, post.source.path);
-    for (const comment of data.comments) if (comment.authorId && comment.authorName) addPerson(people, { id: comment.authorId, displayName: comment.authorName, firstSeen: comment.createdAt, lastSeen: comment.createdAt, identityConfidence: comment.authorId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: comment.source.path, sourcePaths: [comment.source.path] }, comment.source.path);
-    for (const reaction of data.reactions) if (reaction.personId && reaction.personName) addPerson(people, { id: reaction.personId, displayName: reaction.personName, firstSeen: reaction.createdAt, lastSeen: reaction.createdAt, identityConfidence: reaction.personId.startsWith('person:facebook:') ? 'exact' : 'inferred', identitySource: reaction.source.path, sourcePaths: [reaction.source.path] }, reaction.source.path);
-    data.people = [...people.values()]; data.diagnostics.incompleteIdentities = data.people.filter(person => !person.facebookId && !person.username && !person.profileUrl).length;
+    collectPeople();
+    const peopleForImport = [...people.values()];
+    data.diagnostics.incompleteIdentities = peopleForImport.filter(person => !person.facebookId && !person.username && !person.profileUrl).length;
+    await flushJsonBatch(true, peopleForImport.length > 0);
     const warningCounts = new Map<string, { message: string; count: number; sourcePaths: Set<string> }>();
     for (const warning of data.warnings) {
       const category = diagnosticWarningCategory(warning);
@@ -223,7 +262,7 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
     data.warnings = [...new Set(data.warnings)].slice(0, 200);
     data.diagnostics.warningGroups = data.warningGroups;
     const parseDurationMs = Math.round(performance.now() - startedAt);
-    data.performance = { totalDurationMs: parseDurationMs, sectionCounts: Object.fromEntries(sectionCounts), slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs: Math.round(durationMs) })), stageDurationsMs: { parsing: parseDurationMs }, stageCounts: { candidateFiles: candidates.length, normalizedRecords: data.diagnostics.htmlRecordCount ?? 0 }, batchSize: HTML_IMPORT_BATCH_SIZE, batchCount: importBatchCount };
+    data.performance = { totalDurationMs: parseDurationMs, sectionCounts: Object.fromEntries(sectionCounts), slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs: Math.round(durationMs) })), stageDurationsMs: { parsing: parseDurationMs }, stageCounts: { candidateFiles: candidates.length, normalizedRecords: data.diagnostics.htmlRecordCount ?? 0 }, batchSize: HTML_IMPORT_BATCH_SIZE, batchCount: importBatchCount, maxBatchRecords, maxBatchBytes };
     data.diagnostics.performance = data.performance;
     const unsupported = item.detection.unsupportedSections ?? [], imported = item.detection.sections.filter(section => !unsupported.includes(section));
     data.coverage = { detectedSections: item.detection.sections, importedSections: imported, partialSections: data.warnings.length ? imported : [], unsupportedSections: unsupported, malformedSections: [...malformedSections], skippedParts: [], sectionStatuses: item.detection.sections.map(section => ({ section, status: unsupported.includes(section) ? 'unsupported' as const : malformedSections.has(section) ? 'malformed' as const : data.warnings.length ? 'partial' as const : 'imported' as const, parserVersion: FACEBOOK_PARSER_VERSION })) };
@@ -244,7 +283,7 @@ async function parsePart(item: InspectedPart, partCount: number, onBatch?: PartB
 
 async function run(payload: ImportRunRequest) {
   const runStartedAt = performance.now();
-  const files = [...(payload.files ?? (payload.file ? [payload.file] : []))]; if (!files.length) throw new Error('Choose at least one ZIP file.');
+  const files = payload.file ? [payload.file] : []; if (!files.length) throw new Error('Choose at least one ZIP file.');
   const inspected: InspectedPart[] = []; const duplicateNames: string[] = []; const fingerprints = new Set<string>();
   for (let index = 0; index < files.length; index++) {
     let item: InspectedPart;
@@ -268,14 +307,21 @@ async function run(payload: ImportRunRequest) {
     });
     detection = { ...detection, sections: [...new Set([...detection.sections, ...expectedParts.flatMap(part => part.sections ?? [])])], supportedSections: detection.supportedSections, unsupportedSections: detection.unsupportedSections, parts: expectedWithCandidates, archiveSetFingerprint: fingerprint, totalSize: expectedParts.reduce((sum, part) => sum + part.fileSize, 0), entryCount: expectedParts.reduce((sum, part) => sum + part.entryCount, 0), inspectedEntries: expectedParts.reduce((sum, part) => sum + part.entryCount, 0), identity: detection.identity ?? { filename: `${expectedParts.length} Facebook ZIP parts`, size: expectedParts.reduce((sum, part) => sum + part.fileSize, 0), entryCount: expectedParts.reduce((sum, part) => sum + part.entryCount, 0), fingerprint, knownEntries: expectedParts.flatMap(part => part.sections ?? []).slice(0, 80) } };
   }
+  // Expose only a compact path manifest for the runtime source registry. ZIP
+  // readers and entry objects stay private to this worker.
+  for (const item of inspected) {
+    const part = detection.parts?.find(candidate => candidate.manifestFingerprint === item.part.manifestFingerprint) ?? item.part;
+    send({ type: 'manifest', part, paths: item.entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename)) });
+  }
   send({ type: 'progress', stage: 'detected', message: detection.supported ? `Facebook archive detected across ${inspected.length} ZIP part${inspected.length === 1 ? '' : 's'}.` : 'No supported Facebook archive was detected.', completed: inspected.length, total: files.length });
   send({ type: 'progress', stage: 'identity', message: 'Created a local archive-set signature', completed: inspected.length, total: files.length });
+  const singlePartRun = payload.action === 'import-part';
+  const metadataOnlyPart = (item: InspectedPart) => item.detection.sections.length > 0 || item.entries.some(entry => { const path = cleanArchivePath(entry.filename).toLowerCase(); return path.startsWith('your_facebook_activity/') || path.startsWith('personal_information/') || path.startsWith('messages/') || path.startsWith('connections/'); });
   if (payload.action === 'inspect' || payload.action === 'verify') { send({ type: 'result', result: detection }); return; }
-  if (!detection.supported) throw new Error('These ZIP files do not look like a supported Facebook Download Your Information archive.');
+  if (!detection.supported && !(singlePartRun && inspected.some(metadataOnlyPart))) throw new Error('These ZIP files do not look like a supported Facebook Download Your Information archive.');
   const inspectionDurationMs = performance.now() - runStartedAt;
   const completed = new Set(payload.completedPartIds ?? []), skipped = new Set(payload.skippedPartIds ?? []);
   const overallFormat = detection.format ?? 'unknown';
-  const metadataOnlyPart = (item: InspectedPart) => item.detection.sections.length > 0 || item.entries.some(entry => { const path = cleanArchivePath(entry.filename).toLowerCase(); return path.startsWith('your_facebook_activity/') || path.startsWith('personal_information/') || path.startsWith('messages/') || path.startsWith('connections/'); });
   const parseable = inspected.filter(item => (item.detection.supported || ((overallFormat === 'html' || overallFormat === 'mixed') && item.detection.format !== 'json' && metadataOnlyPart(item))) && item.part.status !== 'failed' && !completed.has(item.part.id) && !skipped.has(item.part.id));
   const parts = detection.parts ?? [], partByFingerprint = new Map(parts.map(part => [part.manifestFingerprint, part]));
   // Keep only import metadata in this worker after a part is handed to the
@@ -285,7 +331,7 @@ async function run(payload: ImportRunRequest) {
   const parsedPartIds = new Set<string>();
   const jsonSections = new Set(inspected.filter(candidate => candidate.detection.format === 'json' || candidate.detection.format === 'mixed').flatMap(candidate => candidate.detection.sections));
   const pathOwners = new Map<string, Set<string>>();
-  for (const item of [...inspected].sort((a, b) => a.part.manifestFingerprint.localeCompare(b.part.manifestFingerprint))) for (const entry of item.entries) if (!entry.directory) {
+  if (!singlePartRun) for (const item of [...inspected].sort((a, b) => a.part.manifestFingerprint.localeCompare(b.part.manifestFingerprint))) for (const entry of item.entries) if (!entry.directory) {
     const path = cleanArchivePath(entry.filename); const segments = path.split('/');
     for (let offset = 0; offset < segments.length; offset++) { const suffixSegments = segments.slice(offset); if (offset > 0 && suffixSegments.length < 2) continue; const suffix = suffixSegments.join('/'); if (!suffix) continue; const owners = pathOwners.get(suffix) ?? new Set<string>(); owners.add(item.part.id); pathOwners.set(suffix, owners); }
   }
@@ -309,13 +355,13 @@ async function run(payload: ImportRunRequest) {
      for (const [stage, duration] of Object.entries(rightMetrics.stageDurationsMs ?? {})) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + duration;
      const stageCounts = { ...(leftMetrics.stageCounts ?? {}) };
      for (const [stage, count] of Object.entries(rightMetrics.stageCounts ?? {})) stageCounts[stage] = (stageCounts[stage] ?? 0) + count;
-     data.performance = { totalDurationMs: (leftMetrics.totalDurationMs ?? 0) + (rightMetrics.totalDurationMs ?? 0), sectionCounts, slowestSections: slowest, stageDurationsMs, stageCounts, batchSize: Math.max(leftMetrics.batchSize ?? 0, rightMetrics.batchSize ?? 0) || undefined, batchCount: (leftMetrics.batchCount ?? 0) + (rightMetrics.batchCount ?? 0) }; data.diagnostics.performance = data.performance;
+     data.performance = { totalDurationMs: (leftMetrics.totalDurationMs ?? 0) + (rightMetrics.totalDurationMs ?? 0), sectionCounts, slowestSections: slowest, stageDurationsMs, stageCounts, batchSize: Math.max(leftMetrics.batchSize ?? 0, rightMetrics.batchSize ?? 0) || undefined, batchCount: (leftMetrics.batchCount ?? 0) + (rightMetrics.batchCount ?? 0), maxBatchRecords: Math.max(leftMetrics.maxBatchRecords ?? 0, rightMetrics.maxBatchRecords ?? 0) || undefined, maxBatchBytes: Math.max(leftMetrics.maxBatchBytes ?? 0, rightMetrics.maxBatchBytes ?? 0) || undefined }; data.diagnostics.performance = data.performance;
     const leftCoverage = data.coverage, rightCoverage = partData.coverage;
     if (leftCoverage || rightCoverage) data.coverage = { detectedSections: [...new Set([...(leftCoverage?.detectedSections ?? []), ...(rightCoverage?.detectedSections ?? [])])], importedSections: [...new Set([...(leftCoverage?.importedSections ?? []), ...(rightCoverage?.importedSections ?? [])])], partialSections: [...new Set([...(leftCoverage?.partialSections ?? []), ...(rightCoverage?.partialSections ?? [])])], unsupportedSections: [...new Set([...(leftCoverage?.unsupportedSections ?? []), ...(rightCoverage?.unsupportedSections ?? [])])], malformedSections: [...new Set([...(leftCoverage?.malformedSections ?? []), ...(rightCoverage?.malformedSections ?? [])])], skippedParts: [...new Set([...(leftCoverage?.skippedParts ?? []), ...(rightCoverage?.skippedParts ?? [])])] };
   };
   const parseStartedAt = performance.now();
   for (const item of parseable) {
-    checkCancelled(); const archivePart = partByFingerprint.get(item.part.manifestFingerprint) ?? item.part; const parsedPart = { ...item, part: { ...item.part, ...archivePart, archiveId: archiveSetId(detection.archiveSetFingerprint ?? '') } }; const batchHandler: PartBatchHandler = async batch => {
+    checkCancelled(); const archivePart = partByFingerprint.get(item.part.manifestFingerprint) ?? item.part; const parsedPart = { ...item, part: { ...item.part, ...archivePart, archiveId: singlePartRun ? (payload.archiveSet?.id ?? archivePart.archiveId) : archiveSetId(detection.archiveSetFingerprint ?? '') } }; const batchHandler: PartBatchHandler = async batch => {
       const batchAckId = `${payload.sessionId ?? 'import'}:${parsedPart.part.id}:batch:${Date.now()}:${Math.random().toString(16).slice(2)}`;
       send({ type: 'part-batch', data: batch, part: parsedPart.part, sessionId: payload.sessionId, ackId: batchAckId });
       const acknowledgement = await waitForPartAck(batchAckId);
@@ -325,6 +371,7 @@ async function run(payload: ImportRunRequest) {
     const partData = await parsePart(parsedPart, parts.length, async batch => {
       for (const media of batch.media) {
         if (isSuspiciousPath(media.path)) continue;
+        if (singlePartRun) continue;
         const owners = pathOwners.get(cleanArchivePath(media.path)); const ownerPartId = owners?.size === 1 ? [...owners][0] : undefined;
         if (ownerPartId) media.source = { ...media.source, archivePartId: ownerPartId };
         else { batch.diagnostics ??= { candidateFiles: 0, parsedFiles: 0, unsupportedCandidates: 0, malformedFiles: 0, missingMedia: 0, incompleteIdentities: 0 }; batch.diagnostics.missingMedia += 1; const warning = `${media.source.path}: media reference not found in selected archive parts (${media.path})`; batch.warnings.push(warning); }
@@ -335,6 +382,7 @@ async function run(payload: ImportRunRequest) {
     }, jsonSections);
     for (const media of partData.media) {
       if (isSuspiciousPath(media.path)) continue;
+      if (singlePartRun) continue;
       const owners = pathOwners.get(cleanArchivePath(media.path)); const ownerPartId = owners?.size === 1 ? [...owners][0] : undefined;
       if (ownerPartId) media.source = { ...media.source, archivePartId: ownerPartId };
       else { if (partData.diagnostics) partData.diagnostics.missingMedia += 1; const warning = `${media.source.path}: media reference not found in selected archive parts (${media.path})`; partData.warnings.push(warning); const category = diagnosticWarningCategory(warning); const group = partData.warningGroups?.find(item => item.category === category); if (group) group.count += 1; else partData.warningGroups = [...(partData.warningGroups ?? []), { category, message: 'media reference not found in selected archive parts', count: 1, sourcePaths: [cleanArchivePath(media.source.path)].slice(0, 8) }]; }
@@ -348,9 +396,21 @@ async function run(payload: ImportRunRequest) {
     if (acknowledgement === 'cancelled' || cancelled) checkCancelled();
     if (acknowledgement === 'failed') throw new Error('The local database could not persist an imported ZIP part.');
   }
-  const archiveSet: ArchiveSet = { id: archiveSetId(detection.archiveSetFingerprint ?? ''), platform: 'facebook', createdAt: Date.now(), partCount: parts.length, totalSize: detection.totalSize ?? 0, fingerprint: detection.archiveSetFingerprint ?? '', sourceFormat: detection.format === 'mixed' ? 'mixed' : detection.format === 'html' ? 'html' : 'json', status: 'complete' };
+  // A Facebook download often splits media-only ZIPs away from the structural
+  // JSON/HTML part. There is no normalized text to emit for such a source,
+  // but checkpointing its inspected manifest keeps the logical archive
+  // resumable without forcing the user to hand-skip every media container.
+  if (singlePartRun && parsedPartIds.size === 0 && inspected.length === 1) {
+    const item = inspected[0]; const archivePart = partByFingerprint.get(item.part.manifestFingerprint) ?? item.part;
+    const parsedPart = { ...item, part: { ...item.part, ...archivePart, archiveId: payload.archiveSet?.id ?? archivePart.archiveId, status: 'complete' as const } };
+    const emptyPart = emptyNormalizedData(); emptyPart.archiveParts = [parsedPart.part]; emptyPart.importedSections = item.detection.sections; emptyPart.sourceFormat = item.detection.format ?? 'unknown'; emptyPart.diagnostics = { candidateFiles: 0, parsedFiles: 0, unsupportedCandidates: 0, malformedFiles: 0, missingMedia: 0, incompleteIdentities: 0, sourceFormat: emptyPart.sourceFormat };
+    const ackId = `${payload.sessionId ?? 'import'}:${parsedPart.part.id}:empty`;
+    parsedPartIds.add(parsedPart.part.id); send({ type: 'part-result', data: emptyPart, part: parsedPart.part, sessionId: payload.sessionId, ackId });
+    const acknowledgement = await waitForPartAck(ackId); if (acknowledgement === 'cancelled' || cancelled) checkCancelled(); if (acknowledgement === 'failed') throw new Error('The local database could not persist the inspected ZIP part.');
+  }
+  const archiveSet: ArchiveSet = payload.archiveSet ?? { id: archiveSetId(detection.archiveSetFingerprint ?? ''), platform: 'facebook', createdAt: Date.now(), partCount: parts.length, totalSize: detection.totalSize ?? 0, fingerprint: detection.archiveSetFingerprint ?? '', sourceFormat: detection.format === 'mixed' ? 'mixed' : detection.format === 'html' ? 'html' : 'json', status: 'complete' };
   const failedParts = parts.filter(part => part.status === 'failed' || part.status === 'missing');
-  if (failedParts.length || skipped.size) archiveSet.status = 'incomplete';
+  if (!singlePartRun && (failedParts.length || skipped.size)) archiveSet.status = 'incomplete';
   data.archiveSet = archiveSet; data.sourceFormat = archiveSet.sourceFormat; data.archiveParts = parts.map(part => ({ ...part, archiveId: archiveSet.id, connected: part.status !== 'failed' && part.status !== 'missing' && !skipped.has(part.id), status: part.status === 'failed' ? 'failed' as const : skipped.has(part.id) ? 'skipped' as const : part.status === 'missing' ? 'missing' as const : completed.has(part.id) || parsedPartIds.has(part.id) ? 'complete' as const : 'ready' as const })); data.archiveIdentity = detection.identity ?? data.archiveIdentity; data.importedSections = detection.sections.filter(section => !(detection.unsupportedSections ?? []).includes(section)); data.warnings = [...new Set([...detection.warnings, ...data.warnings])].slice(0, 200);
   const finalWarningGroups = new Map<string, { message: string; count: number; sourcePaths: Set<string> }>();
   for (const group of data.warningGroups ?? []) finalWarningGroups.set(group.category, { message: group.message, count: group.count, sourcePaths: new Set(group.sourcePaths) });
@@ -376,7 +436,7 @@ async function run(payload: ImportRunRequest) {
   const unsupportedSections = detection.unsupportedSections ?? [];
   const malformedSections = [...new Set([...(data.coverage?.malformedSections ?? []), ...(failedParts.length ? detection.sections : [])])];
   const partialSections = [...new Set([...(data.coverage?.partialSections ?? []), ...(data.warnings.length ? data.importedSections : [])])];
-  data.coverage = { detectedSections: detection.sections, importedSections: data.importedSections, partialSections, unsupportedSections, malformedSections, skippedParts: [...skipped], sectionStatuses: detection.sections.map(section => ({ section, status: unsupportedSections.includes(section) ? 'unsupported' as const : malformedSections.includes(section) ? 'malformed' as const : partialSections.includes(section) ? 'partial' as const : 'imported' as const, parserVersion: FACEBOOK_PARSER_VERSION })) };
+  data.coverage = { detectedSections: detection.sections, importedSections: data.importedSections ?? [], partialSections, unsupportedSections, malformedSections, skippedParts: [...skipped], sectionStatuses: detection.sections.map(section => ({ section, status: unsupportedSections.includes(section) ? 'unsupported' as const : malformedSections.includes(section) ? 'malformed' as const : partialSections.includes(section) ? 'partial' as const : 'imported' as const, parserVersion: FACEBOOK_PARSER_VERSION })) };
   checkCancelled();
   send({ type: 'progress', stage: 'media', message: 'Checking media references across archive parts…', completed: data.media.length, total: data.media.length, partCount: inspected.length }); send({ type: 'progress', stage: 'search', message: 'Preparing local search index…', partCount: inspected.length }); send({ type: 'progress', stage: 'complete', message: archiveSet.status === 'complete' ? 'Local import complete' : 'Local import paused with incomplete parts', completed: data.archiveParts?.filter(part => part.status === 'complete').length ?? 0, total: data.archiveParts?.length ?? 0, partCount: inspected.length }); send({ type: 'import-result', data, sessionId: payload.sessionId });
 }

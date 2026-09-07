@@ -1,6 +1,6 @@
 # SocialVault
 
-> **Development status:** Milestone 10 is complete. SocialVault can import large Facebook JSON or HTML export sets incrementally, checkpoint normalized source data and derived indexes, resume after cancellation or reload, and browse the archive locally while indexing continues.
+> **Development status:** Milestone 11 is complete. SocialVault can inspect and import large Facebook JSON or HTML export sets with browser-scale source I/O, bounded memory handoffs, checkpointed normalized data and derived indexes, and reconnectable local media sources.
 
 **Browse your social media history without giving your social media history to someone else.**
 
@@ -74,6 +74,20 @@ SocialVault aims to reconstruct as much of your downloaded social media history 
 - Framework-neutral normalized model types; UI pages never read raw Facebook JSON
 - Synthetic-only Vitest and Playwright coverage
 
+### Milestone 11 browser-scale hardening
+
+- Compact runtime source registry: React state keeps names, sizes, and source keys while `File` objects and folder handles stay outside the UI store
+- File System Access folder discovery enumerates ZIP handles without eagerly calling `getFile()`; ZIP bytes are materialized only for the part currently being inspected or imported
+- One-part-at-a-time worker orchestration; each import worker receives one `File`, acknowledges bounded batches, and is terminated before the next part is opened
+- JSON and HTML normalized handoffs are bounded by both record count and an estimated byte budget; maximum batch observations are retained in local import metrics
+- Source manifests are retained as compact path sets for cross-part media ownership and safe reconnects; ZIP reader/entry objects do not cross the worker boundary
+- Large imports release ordinary `File` references after checkpointing; browser handles remain reconnectable, while detached files report an explicit reconnect requirement for media
+- Media extraction remains demand-driven: the media worker opens only the requested connected ZIP and never registers or scans the whole archive set
+- Browser storage selection is capability-driven: OPFS is used when it initializes and remains writable; IndexedDB snapshots are activated only after an unavailable/failed OPFS path, with the reason included in diagnostics
+- Storage diagnostics include the active backend, fallback reason when applicable, and the current normalized SQLite page size (source ZIP bytes are not used as a database-size proxy)
+- Archive Overview shows the active storage path and source-part status while preserving local-only text browsing when media parts are detached
+- Chromium selection profiling covers 1, 5, 10, and 40 ZIP selections without growing the DOM or JavaScript heap with the selected source bytes
+
 ### Resumable import and compatibility hardening
 
 - Persisted import state machine (`new`, `importing`, `indexing`, `complete`, `cancelled`, `interrupted`, and `failed`) with a session ID, parser/schema versions, counts, warnings, and timestamps
@@ -107,7 +121,7 @@ The adapter recognizes profile files containing `profile_information`, `profile_
 
 ### Browser storage
 
-On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. Very large ZIP sets proactively use the fallback path to avoid an archive-sized OPFS write; when OPFS cannot be initialized—or a recoverable OPFS write/quota failure occurs—SocialVault uses an in-memory SQLite database for queries and stores a chunked SQLite WASM snapshot plus import-session state in IndexedDB so normalized rows and resumable checkpoints remain available across sessions. Snapshot chunks are written under a private generation and published only after all chunks commit; a quota failure leaves the previous readable snapshot intact. Migration 5 adds the activity ledger, migration 6 adds the logical archive/part catalog, migration 7 adds sessions/checkpoints/section status/rebuild jobs/warning groups, migration 8 records JSON/HTML format on archive sets and parts, and migration 9 records source/derived status plus checkpointed derived-index jobs; older databases are upgraded without a destructive re-import. Both stores are origin-private and device-local; clearing site data removes them.
+On browsers with compatible worker OPFS support, SQLite stores `socialvault.sqlite3` in the browser's Origin Private File System. SocialVault does not switch away from OPFS merely because the source ZIP set is large: it uses OPFS when it initializes and remains writable. When OPFS cannot be initialized—or a recoverable OPFS write/quota failure occurs—SocialVault uses an in-memory SQLite database for queries and stores a chunked SQLite WASM snapshot plus import-session state in IndexedDB so normalized rows and resumable checkpoints remain available across sessions. The selected backend and fallback reason are included in the Archive Overview and privacy-safe diagnostics. Snapshot chunks are written under a private generation and published only after all chunks commit; a quota failure leaves the previous readable snapshot intact. Migration 5 adds the activity ledger, migration 6 adds the logical archive/part catalog, migration 7 adds sessions/checkpoints/section status/rebuild jobs/warning groups, migration 8 records JSON/HTML format on archive sets and parts, and migration 9 records source/derived status plus checkpointed derived-index jobs; older databases are upgraded without a destructive re-import. Both stores are origin-private and device-local; clearing site data removes them.
 
 The imported text, people, statistics, media metadata, archive-set fingerprint, and per-part checkpoints remain usable after a reload even when none of the original ZIPs are selected. Search and activity become available as their derived jobs finish; if either job is interrupted, the base source import remains clearly labeled and can resume from its last checkpoint. Reconnect all available parts—or only a subset—in one file or folder action; matching uses the deterministic manifest fingerprint, with filename/size/entry count retained as diagnostics. A renamed but otherwise matching ZIP is accepted when its manifest identity matches; a mismatch never auto-binds or re-imports. File handles are runtime-only and are not serialized into SQLite or IndexedDB. A folder handle may require permission again after reload, so **Reconnect archive folder** is always available as a user-initiated action.
 
@@ -144,8 +158,9 @@ Instead:
 1. Download your information from Facebook in JSON or HTML format.
 2. Open SocialVault.
 3. Select or drag one or all ZIP parts into the application. If Facebook gave you 40 ZIP files, select all 40 together; or choose **Select archive folder** to discover ZIPs recursively in a user-selected directory where the browser permits it.
-4. SocialVault validates and inspects each part locally, one at a time, before showing the archive set for review.
-5. Choose **Start local import** to parse supported JSON or HTML in a worker. HTML pages are tokenized incrementally, normalized records are acknowledged in bounded batches, and each completed part is committed and checkpointed before the next part is parsed.
+   For very large multipart exports, the folder picker is recommended because it keeps file handles lazy until each part is processed.
+4. SocialVault validates and inspects each part locally, one at a time, before showing the archive set for review. Folder selection keeps directory handles until a part is needed; it does not read every ZIP into memory up front.
+5. Choose **Start local import** to parse supported JSON or HTML in a worker. HTML pages and JSON chunks are tokenized/normalized incrementally, bounded records are acknowledged in byte- and count-limited batches, and each completed part is committed and checkpointed before the next part is parsed.
 6. If the import is cancelled or interrupted, reload the app, choose **Reconnect archive files** or **Reconnect archive folder**, and select **Resume import**. Only remaining parts are parsed.
 7. Browse the normalized Profile/About, People/Friends, Posts, Albums, Messages, Search, and Photos views; rebuild derived indexes or export privacy-safe diagnostics from Archive Overview when needed.
 
@@ -240,7 +255,7 @@ Examples of indexed information include:
 
 SQLite FTS5 provides local full-text search for posts, messages, conversation titles, participants, and profiles. When a browser build cannot create FTS5, the same database worker falls back to a bounded SQL `LIKE` search over mirrored documents.
 
-Large media files remain associated with their original archive instead of unnecessarily being copied into the database. HTML is tokenized with parse5 from zip.js byte streams. The tokenizer pauses at 5,000 normalized records; the import worker coalesces records into a bounded handoff of up to 5,000 records before waiting for SQLite, and SQLite writes use 2,000-row statement batches. Checkpoints are committed per ZIP part, while batch acknowledgements keep the in-flight normalized queue bounded. Search and activity indexes use the same 5,000-row checkpoint window and persist their row cursor for safe resume.
+Large media files remain associated with their original archive instead of unnecessarily being copied into the database. HTML is tokenized with parse5 from zip.js byte streams. The tokenizer pauses at 5,000 normalized records; the import worker coalesces JSON/HTML records into a bounded handoff of up to 5,000 records or approximately 8 MiB of estimated normalized text before waiting for SQLite, and SQLite writes use 2,000-row statement batches. Checkpoints are committed per ZIP part, while batch acknowledgements keep the in-flight normalized queue bounded. Search and activity indexes use the same 5,000-row checkpoint window and persist their row cursor for safe resume.
 
 ---
 
@@ -362,7 +377,7 @@ Instead, it should:
 
 If the browser is reopened later, normalized text and search remain available without the source files. Reconnect all available ZIPs—or only a subset—to resume the next incomplete checkpoint and restore lazy media previews. Media tied to a missing part remains visible as metadata and reports `Archive part not connected` rather than disabling the archive. A failed part can be retried, or explicitly skipped with the archive remaining visibly incomplete.
 
-The project should eventually be capable of handling archives containing millions of Messenger messages and tens of thousands of media files.
+The project should eventually be capable of handling archives containing millions of Messenger messages and tens of thousands of media files. Browser memory and storage quotas still vary by browser and device; for the largest exports, a Chromium profile run is recommended before leaving a long import unattended.
 
 ---
 
@@ -407,7 +422,7 @@ Each platform remains responsible for determining what information is included i
 
 SocialVault can only reconstruct information available in the archive supplied by the user.
 
-## Recommended Milestone 11
+## Recommended Milestone 12
 
 Extend the single-archive experience with broader relationship reconstruction: richer interaction aggregation on person pages, more Facebook HTML variants, and scalable graph-oriented browsing. Keep archive processing, search, diagnostics, and storage local. Multi-archive workspaces and export merging should remain out of scope until this single logical archive experience is mature.
 

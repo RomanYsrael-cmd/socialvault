@@ -2,8 +2,17 @@ import type { ArchivePart, ArchiveSet, NormalizedArchiveData, Person, SourceRef 
 
 /** Small deterministic local hash; it is a signature, not a security primitive. */
 export function hashText(value: string) {
+  return hashTextParts([value]);
+}
+/** Hash sorted manifest components incrementally so no giant joined string is retained. */
+export function hashTextParts(parts: Iterable<string>) {
   let result = 2166136261;
-  for (let index = 0; index < value.length; index++) { result ^= value.charCodeAt(index); result = Math.imul(result, 16777619); }
+  let first = true;
+  for (const part of parts) {
+    if (!first) { result ^= 124; result = Math.imul(result, 16777619); }
+    for (let index = 0; index < part.length; index++) { result ^= part.charCodeAt(index); result = Math.imul(result, 16777619); }
+    first = false;
+  }
   return (result >>> 0).toString(16).padStart(8, '0');
 }
 
@@ -11,7 +20,7 @@ export interface ManifestEntry { filename: string; directory?: boolean; uncompre
 export function cleanArchivePath(path: string) { return path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\//, ''); }
 export function manifestFingerprint(entries: ManifestEntry[]) {
   const manifest = entries.filter(entry => !entry.directory).map(entry => `${cleanArchivePath(entry.filename)}:${entry.uncompressedSize ?? 0}:${entry.compressedSize ?? 0}`).sort();
-  return hashText(manifest.join('|'));
+  return hashTextParts(manifest);
 }
 export function knownManifestEntries(entries: ManifestEntry[], limit = 80) {
   return entries.filter(entry => !entry.directory).map(entry => cleanArchivePath(entry.filename)).sort().slice(0, limit);
@@ -114,7 +123,12 @@ export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedA
   result.conversations = [...conversations.values()]; result.messages = byId(result.messages); result.media = byId(result.media); result.warnings = [...new Set(result.warnings)];
   result.archiveParts = byId(result.archiveParts ?? []);
   result.warningGroups = [...warningGroups.values()].map(group => ({ category: group.category, message: group.message, count: group.count, sourcePaths: [...group.sourcePaths].slice(0, 8) }));
-  if (result.diagnostics) { result.diagnostics.warningGroups = result.warningGroups; result.diagnostics.performance = { totalDurationMs, sectionCounts, slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs })) }; }
+  if (result.diagnostics) {
+    const maxBatchRecords = Math.max(...parts.map(data => data.performance?.maxBatchRecords ?? data.diagnostics?.performance?.maxBatchRecords ?? 0), 0);
+    const maxBatchBytes = Math.max(...parts.map(data => data.performance?.maxBatchBytes ?? data.diagnostics?.performance?.maxBatchBytes ?? 0), 0);
+    result.diagnostics.warningGroups = result.warningGroups;
+    result.diagnostics.performance = { totalDurationMs, sectionCounts, slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs })), maxBatchRecords: maxBatchRecords || undefined, maxBatchBytes: maxBatchBytes || undefined };
+  }
   if (totalDurationMs || Object.keys(sectionCounts).length) result.performance = result.diagnostics?.performance;
   result.coverage = { detectedSections: [...new Set(parts.flatMap(data => data.coverage?.detectedSections ?? data.importedSections ?? []))], importedSections: [...new Set(parts.flatMap(data => data.coverage?.importedSections ?? data.importedSections ?? []))], partialSections: [...new Set(parts.flatMap(data => data.coverage?.partialSections ?? []))], unsupportedSections: [...new Set(parts.flatMap(data => data.coverage?.unsupportedSections ?? []))], malformedSections: [...new Set(parts.flatMap(data => data.coverage?.malformedSections ?? []))], skippedParts: [...new Set(parts.flatMap(data => data.coverage?.skippedParts ?? []))] };
   return result;
