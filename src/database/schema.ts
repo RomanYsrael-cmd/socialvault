@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION=9;
+export const SCHEMA_VERSION=10;
 export type Migration={version:number;statements:readonly string[]};
 // Version 1 is kept byte-for-byte equivalent to the Milestone 2 schema. New changes append migrations.
 export const MIGRATIONS:readonly Migration[]=[
@@ -124,6 +124,7 @@ export const MIGRATIONS:readonly Migration[]=[
     `CREATE INDEX IF NOT EXISTS idx_activity_occurred_id ON activity_records(occurred_at DESC,id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_search_documents_created_id ON search_documents(created_at DESC,entity_id ASC)`,
     `UPDATE import_sessions SET source_status=CASE WHEN status='complete' THEN 'complete' WHEN status IN ('importing','indexing') THEN 'importing' ELSE 'incomplete' END WHERE source_status='pending'`
-  ]}
+  ]},
+  {version:10,statements:[`CREATE TABLE IF NOT EXISTS import_source_checkpoints (session_id TEXT NOT NULL, archive_part_id TEXT NOT NULL, source_path TEXT NOT NULL, parser_version TEXT NOT NULL, PRIMARY KEY(session_id,archive_part_id,source_path))`]}
 ];
 export const FTS5_SCHEMA=`CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(entity_type UNINDEXED, entity_id UNINDEXED, title, body, context, created_at UNINDEXED, conversation_id UNINDEXED, source_path UNINDEXED)`;

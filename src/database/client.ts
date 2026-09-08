@@ -1,3 +1,4 @@
+import { liveImportMetrics } from '../archive/import-metrics';
 import type { ActivityRecord, ActivityType, ArchiveCoverage, ArchiveIdentity, ArchivePart, Connection, ImportPartCheckpoint, ImportSession, Media, Message, NormalizedArchiveData, Person, Post, Profile } from '../archive/schemas/models';
 import type { AlbumDetail, AlbumSummary, ArchiveStats, ArchiveStatus, ConversationPreview, DatabaseProgress, DatabaseRequest, DatabaseResponse, ImportState, MemoryRecord, Page, PersonSummary, RebuildResult, SearchResponse, ConnectionSummary, StorageStatus } from './types';
 
@@ -10,6 +11,7 @@ function call<T>(request: Omit<DatabaseRequest, 'id'>, progress?: (value: Databa
   if (!worker) {
     worker = new Worker(new URL('./database.worker.ts', import.meta.url), { type: 'module' });
     worker.onmessage = (event: MessageEvent<DatabaseResponse>) => {
+      if ((event.data as any).type === 'pipeline-metrics') { liveImportMetrics.database = (event.data as any).metrics; return; }
       if ((event.data as unknown as DatabaseProgress).type === 'progress') { const update = event.data as unknown as DatabaseProgress; pending.get(update.requestId)?.progress?.(update); return; }
       const promise = pending.get(event.data.id); if (!promise) return;
       pending.delete(event.data.id); event.data.ok ? promise.resolve(event.data.data) : promise.reject(new Error(event.data.error));
@@ -26,6 +28,7 @@ export const database = {
   init() { return ready ??= call<StorageStatus>({ type: 'init' }); },
   storageStatus() { return this.init().then(() => call<StorageStatus>({ type: 'storage-status' })); },
   replace(data: NormalizedArchiveData) { return this.init().then(() => call<void>({ type: 'replace', data })); },
+  sourceCheckpoints(sessionId: string, part: ArchivePart) { return this.init().then(() => call<string[]>({ type: 'source-checkpoints', sessionId, part })); },
   importState(sessionId?: string) { return this.init().then(() => call<ImportState>({ type: 'import-state', sessionId })); },
   beginImport(session: ImportSession, parts: ArchivePart[], archiveSet?: NormalizedArchiveData['archiveSet'], archiveIdentity?: NormalizedArchiveData['archiveIdentity']) { return this.init().then(() => call<ImportState>({ type: 'begin-import', session, data: { ...emptyData(), archiveParts: parts, archiveSet, archiveIdentity } })); },
   importPart(sessionId: string, part: ArchivePart, data: NormalizedArchiveData) { return this.init().then(() => call<ImportPartCheckpoint>({ type: 'import-part', sessionId, part, data })); },

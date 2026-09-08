@@ -1,3 +1,4 @@
+import { importMeter } from '../import-metrics';
 import { Tokenizer } from 'parse5';
 import { hashText } from '../archive-set';
 import { safeExternalUrl, safeFacebookUrl, isSuspiciousPath } from '../security';
@@ -219,12 +220,12 @@ class StreamingFacebookHtmlParser {
 
   async feed(text: string, isLastChunk = false) {
     this.options.checkCancelled?.();
-    this.tokenizer.write(text, isLastChunk);
+    const start = performance.now(); this.tokenizer.write(text, isLastChunk); importMeter.add('tokenize-normalize', performance.now() - start, 0, text.length * 2);
     while (this.paused) {
       await this.flushBatch();
       this.options.checkCancelled?.();
       this.paused = false;
-      this.tokenizer.resume();
+      const start = performance.now(); this.tokenizer.resume(); importMeter.add('tokenize-normalize', performance.now() - start);
     }
     this.options.checkCancelled?.();
   }
@@ -340,7 +341,7 @@ class StreamingFacebookHtmlParser {
     if (frame.card) {
       const cardIndex = this.cards.lastIndexOf(frame.card);
       if (cardIndex >= 0) this.cards.splice(cardIndex, 1);
-      this.emitCard(frame.card);
+      const start = performance.now(); this.emitCard(frame.card); importMeter.add('normalization', performance.now() - start);
     }
   }
 
@@ -494,7 +495,7 @@ class StreamingFacebookHtmlParser {
   private push<K extends keyof Pick<NormalizedArchiveData, 'people' | 'profileFacts' | 'posts' | 'comments' | 'reactions' | 'connections' | 'albums' | 'conversations' | 'messages' | 'media'>>(key: K, value: NonNullable<NormalizedArchiveData[K]>[number]) {
     if (this.retainRecords) (this.data[key] as unknown as unknown[]).push(value);
     (this.batch[key] as unknown as unknown[]).push(value);
-    this.totalRecords++; this.batchRecords++; this.maxBuffered = Math.max(this.maxBuffered, this.batchRecords);
+    importMeter.add('normalized', 0, 1); this.totalRecords++; this.batchRecords++; this.maxBuffered = Math.max(this.maxBuffered, this.batchRecords);
     const lowerPath = this.path.toLowerCase();
     const section = hasPathSegment(lowerPath, 'messages') ? 'Messages' : lowerPath.includes('connections/') ? 'Friends' : lowerPath.includes('comment') ? 'Comments' : lowerPath.includes('reaction') || lowerPath.includes('likes_and_reactions') ? 'Reactions' : lowerPath.includes('/album') || lowerPath.includes('albums') ? 'Albums' : lowerPath.includes('your_photos') || lowerPath.includes('your_videos') ? 'Photos' : hasPathSegment(lowerPath, 'posts') || lowerPath.includes('your_posts') ? 'Posts' : undefined;
     if (section) this.sectionRecordCounts[section] = (this.sectionRecordCounts[section] ?? 0) + 1;
@@ -505,7 +506,7 @@ class StreamingFacebookHtmlParser {
     if (!this.options.onBatch || !this.batchRecords) return;
     const next = { ...emptyData(), people: this.batch.people.splice(0), profileFacts: this.batch.profileFacts.splice(0), posts: this.batch.posts.splice(0), comments: this.batch.comments.splice(0), reactions: this.batch.reactions.splice(0), connections: this.batch.connections.splice(0), albums: this.batch.albums.splice(0), conversations: this.batch.conversations.splice(0), messages: this.batch.messages.splice(0), media: this.batch.media.splice(0) };
     this.batchRecords = 0;
-    await this.options.onBatch(next);
+    const start = performance.now(); await this.options.onBatch(next); importMeter.add('enqueue-and-ack', performance.now() - start);
   }
 }
 
@@ -527,10 +528,18 @@ export interface HtmlEntryLike { getData(writer: WritableStream<Uint8Array>): Pr
 export async function parseFacebookHtmlEntry(entry: HtmlEntryLike, sourcePath: string, options: HtmlParserOptions = {}): Promise<HtmlParseResult> {
   const parser = new StreamingFacebookHtmlParser(sourcePath, options);
   const decoder = new TextDecoder('utf-8', { fatal: false });
+  let waiting = performance.now();
   await entry.getData(new WritableStream<Uint8Array>({
     write: async chunk => {
+      const waitMs = performance.now() - waiting;
+      // zip.js performs inflation before delivering each bounded stream
+      // chunk. Keep both labels so diagnostics can distinguish the archive
+      // stream wait from parser work; they intentionally overlap.
+      importMeter.add('zip-stream-wait', waitMs, 0, chunk.byteLength);
+      importMeter.add('decompress', waitMs, 0, chunk.byteLength);
       options.checkCancelled?.();
       await parser.feed(decoder.decode(chunk, { stream: true }), false);
+      waiting = performance.now();
     },
     close: async () => {
       const tail = decoder.decode();

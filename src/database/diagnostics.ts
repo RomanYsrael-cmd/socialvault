@@ -9,7 +9,8 @@ export interface DiagnosticsInput {
   coverage?: ArchiveCoverage;
   diagnostics?: ImportDiagnostics;
   warnings?: number;
-  storageMode?: 'opfs' | 'indexeddb';
+  storageMode?: 'opfs' | 'indexeddb' | 'memory';
+  storageVfs?: string;
   storageFallbackReason?: string;
   databaseSizeBytes?: number;
 }
@@ -36,6 +37,10 @@ const safeMetrics = (metrics?: ImportSession['metrics']) => metrics ? {
   slowestSections: metrics.slowestSections ?? [],
   stageDurationsMs: metrics.stageDurationsMs ?? {},
   stageCounts: metrics.stageCounts ?? {},
+  stageRows: metrics.stageRows ?? {},
+  stageBytes: metrics.stageBytes ?? {},
+  stageMaxLatencyMs: metrics.stageMaxLatencyMs ?? {},
+  slowestFiles: metrics.slowestFiles ?? [],
   batchSize: metrics.batchSize ?? null,
   batchCount: metrics.batchCount ?? 0,
   maxBatchRecords: metrics.maxBatchRecords ?? null,
@@ -69,8 +74,8 @@ export function createDiagnosticsReport(input: DiagnosticsInput) {
     },
     import: session ? { id: '<session>', status: session.status, stage: session.currentStage, startedAt: session.startedAt, updatedAt: session.updatedAt, expectedParts: session.expectedPartCount, inspectedParts: session.inspectedPartCount, importedParts: session.importedPartCount, failedParts: session.failedPartCount, skippedParts: session.skippedPartCount, normalizedCounts: session.normalizedCounts, warnings: session.warningsCount, failedPartIds: session.failedPartIds?.length ?? 0, skippedPartIds: session.skippedPartIds?.length ?? 0, metrics: safeMetrics(session.metrics) } : null,
     coverage: safeCoverage,
-    storage: { mode: input.storageMode ?? null, fallbackReason: input.storageFallbackReason ?? null, databaseSizeBytes: input.databaseSizeBytes ?? null },
-    diagnostics: input.diagnostics ? { candidateFiles: input.diagnostics.candidateFiles, parsedFiles: input.diagnostics.parsedFiles, unsupportedCandidates: input.diagnostics.unsupportedCandidates, malformedFiles: input.diagnostics.malformedFiles, missingMedia: input.diagnostics.missingMedia, incompleteIdentities: input.diagnostics.incompleteIdentities, htmlCandidateFiles: input.diagnostics.htmlCandidateFiles ?? 0, htmlParsedFiles: input.diagnostics.htmlParsedFiles ?? 0, htmlRecordCount: input.diagnostics.htmlRecordCount ?? 0, sourceFormat: input.diagnostics.sourceFormat ?? null, warningGroups: input.diagnostics.warningGroups?.map(group => ({ category: safeCategory(group.category), count: group.count, sourcePaths: group.sourcePaths.map(safePath) })), shapeSignatures: input.diagnostics.shapeSignatures?.map(safeShape), performance: input.diagnostics.performance ?? null } : null,
+    storage: { mode: input.storageMode ?? null, vfs: input.storageVfs ?? null, fallbackReason: input.storageFallbackReason ?? null, databaseSizeBytes: input.databaseSizeBytes ?? null },
+    diagnostics: input.diagnostics ? { candidateFiles: input.diagnostics.candidateFiles, parsedFiles: input.diagnostics.parsedFiles, unsupportedCandidates: input.diagnostics.unsupportedCandidates, malformedFiles: input.diagnostics.malformedFiles, missingMedia: input.diagnostics.missingMedia, incompleteIdentities: input.diagnostics.incompleteIdentities, htmlCandidateFiles: input.diagnostics.htmlCandidateFiles ?? 0, htmlParsedFiles: input.diagnostics.htmlParsedFiles ?? 0, htmlRecordCount: input.diagnostics.htmlRecordCount ?? 0, sourceFormat: input.diagnostics.sourceFormat ?? null, warningGroups: input.diagnostics.warningGroups?.map(group => ({ category: safeCategory(group.category), count: group.count, sourcePaths: group.sourcePaths.map(safePath) })), shapeSignatures: input.diagnostics.shapeSignatures?.map(safeShape), performance: input.diagnostics.performance ?? (session ? safeMetrics(session.metrics) : null) } : null,
     privacy: { includesArchiveContent: false, includesNames: false, includesMessageText: false, includesPostText: false, includesMediaBytes: false, includesRawJson: false },
   };
 }

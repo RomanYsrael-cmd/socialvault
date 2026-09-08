@@ -9,6 +9,14 @@ const markers:Marker[]=[
   {needle:'your_activity_across_facebook',section:'Activity',supported:false},{needle:'saved_items',section:'Saved items',supported:false},{needle:'saved',section:'Saved items',supported:false},{needle:'search_history',section:'Search history',supported:false},{needle:'searches',section:'Search history',supported:false},{needle:'groups',section:'Groups',supported:false},{needle:'events',section:'Events',supported:false},{needle:'location_history',section:'Location history',supported:false},{needle:'ads',section:'Ads',supported:false},{needle:'security',section:'Security',supported:false},{needle:'payments',section:'Payments',supported:false}
 ];
 
+// Facebook HTML exports can be split across a structural ZIP and several
+// media-only ZIPs.  A media-only part is safe to retain as a connected source
+// only when every file is a media asset under a Facebook export root.  Keep
+// this deliberately strict so an arbitrary collection of images is still
+// rejected by the archive detector.
+const mediaExtension= /\.(?:jpe?g|png|gif|webp|heic|mp4|mov|m4v|avi|mkv|mp3|m4a|wav|ogg|pdf)$/i;
+const facebookMediaRoot= (path:string) => /^(?:your_facebook_activity|personal_information|messages|connections|facebook)\//i.test(path);
+
 export const facebookSectionForPath=(filename:string)=>{
   const path=filename.toLowerCase().replaceAll('\\','/');
   const found=markers.filter(marker=>path.includes(marker.needle));
@@ -31,6 +39,7 @@ export const facebookDetector:ArchiveDetector={platform:'facebook',detect(entrie
   // merely happens to contain a Facebook-looking filename remains rejected.
   const htmlStructure = htmlCount > 0 && sections.length > 0 && paths.some(path => path.startsWith('your_facebook_activity/') || path.startsWith('personal_information/') || path.startsWith('profile_information/') || path.startsWith('profile_v2/') || path.startsWith('messages/') || path.startsWith('connections/') || path.startsWith('facebook/'));
   const supported=(jsonCount>0 || htmlStructure)&&(identity||structure||sections.length>0);
+  const mediaOnlyEligible = format === 'unknown' && paths.some(path => path && !path.endsWith('/')) && paths.filter(path => !path.endsWith('/')).every(path => facebookMediaRoot(path) && mediaExtension.test(path));
   const warnings:string[]=[];
   if(supported&&supportedSections.length<2)warnings.push('Only a limited set of recognizable Facebook sections was found.');
   if(format==='html'&&sections.length&&!supported)warnings.push('Facebook HTML export markers were found, but no supported structural HTML file was detected.');
@@ -38,5 +47,5 @@ export const facebookDetector:ArchiveDetector={platform:'facebook',detect(entrie
   if(format==='mixed')warnings.push('This archive contains both JSON and HTML Facebook export files. JSON is preferred where a section has JSON coverage; supported HTML pages fill gaps.');
   if(unsupportedSections.length)warnings.push(`Detected unsupported Facebook sections: ${unsupportedSections.join(', ')}.`);
   const confidence=supported?Math.min(.98,.55+sections.length*.06):((format==='html'&&sections.length>0) ? .2 : .05);
-  return {supported,platform:supported?'facebook':'unknown',confidence,entryCount:entries.length,inspectedEntries:entries.length,sections,supportedSections,unsupportedSections,warnings,format};
+  return {metadataOnlyEligible: mediaOnlyEligible, supported,platform:supported?'facebook':'unknown',confidence,entryCount:entries.length,inspectedEntries:entries.length,sections,supportedSections,unsupportedSections,warnings,format};
 }};

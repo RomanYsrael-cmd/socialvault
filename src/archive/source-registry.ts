@@ -83,7 +83,7 @@ class ArchiveSourceRegistry {
     const used = new Set<string>();
     for (const part of parts) {
       const previous = this.partToSource.get(part.id);
-      if (previous) used.add(previous);
+      if (previous && this.sources.get(previous)?.partId === part.id && this.isAvailable(part.id)) { used.add(previous); continue; }
       const candidate = [...this.sources.values()].find(source => {
         if (used.has(source.key)) return false;
         if (source.name !== part.filename) return false;

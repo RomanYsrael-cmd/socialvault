@@ -126,8 +126,19 @@ export function mergeNormalizedData(parts: NormalizedArchiveData[]): NormalizedA
   if (result.diagnostics) {
     const maxBatchRecords = Math.max(...parts.map(data => data.performance?.maxBatchRecords ?? data.diagnostics?.performance?.maxBatchRecords ?? 0), 0);
     const maxBatchBytes = Math.max(...parts.map(data => data.performance?.maxBatchBytes ?? data.diagnostics?.performance?.maxBatchBytes ?? 0), 0);
+    const stageDurationsMs: Record<string, number> = {}, stageCounts: Record<string, number> = {}, stageRows: Record<string, number> = {}, stageBytes: Record<string, number> = {}, stageMaxLatencyMs: Record<string, number> = {};
+    const slowestFiles: Array<{ file: number; bytes: number; records: number; ms: number; dbWaitMs: number }> = [];
+    for (const part of parts) {
+      const metrics = part.performance ?? part.diagnostics?.performance;
+      for (const [stage, value] of Object.entries(metrics?.stageDurationsMs ?? {})) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + value;
+      for (const [stage, value] of Object.entries(metrics?.stageCounts ?? {})) stageCounts[stage] = (stageCounts[stage] ?? 0) + value;
+      for (const [stage, value] of Object.entries(metrics?.stageRows ?? {})) stageRows[stage] = (stageRows[stage] ?? 0) + value;
+      for (const [stage, value] of Object.entries(metrics?.stageBytes ?? {})) stageBytes[stage] = (stageBytes[stage] ?? 0) + value;
+      for (const [stage, value] of Object.entries(metrics?.stageMaxLatencyMs ?? {})) stageMaxLatencyMs[stage] = Math.max(stageMaxLatencyMs[stage] ?? 0, value);
+      slowestFiles.push(...(metrics?.slowestFiles ?? []));
+    }
     result.diagnostics.warningGroups = result.warningGroups;
-    result.diagnostics.performance = { totalDurationMs, sectionCounts, slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs })), maxBatchRecords: maxBatchRecords || undefined, maxBatchBytes: maxBatchBytes || undefined };
+    result.diagnostics.performance = { totalDurationMs, sectionCounts, slowestSections: [...sectionDurations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs })), stageDurationsMs, stageCounts, stageRows, stageBytes, stageMaxLatencyMs, slowestFiles: slowestFiles.sort((a, b) => b.ms - a.ms).slice(0, 10), maxBatchRecords: maxBatchRecords || undefined, maxBatchBytes: maxBatchBytes || undefined };
   }
   if (totalDurationMs || Object.keys(sectionCounts).length) result.performance = result.diagnostics?.performance;
   result.coverage = { detectedSections: [...new Set(parts.flatMap(data => data.coverage?.detectedSections ?? data.importedSections ?? []))], importedSections: [...new Set(parts.flatMap(data => data.coverage?.importedSections ?? data.importedSections ?? []))], partialSections: [...new Set(parts.flatMap(data => data.coverage?.partialSections ?? []))], unsupportedSections: [...new Set(parts.flatMap(data => data.coverage?.unsupportedSections ?? []))], malformedSections: [...new Set(parts.flatMap(data => data.coverage?.malformedSections ?? []))], skippedParts: [...new Set(parts.flatMap(data => data.coverage?.skippedParts ?? []))] };

@@ -8,7 +8,9 @@ export function mergeDetectionResults(results: readonly DetectionResult[], dupli
   for (const result of results) for (const part of result.parts ?? []) if (!partsByFingerprint.has(part.manifestFingerprint)) partsByFingerprint.set(part.manifestFingerprint, part);
   const rawParts = [...partsByFingerprint.values()];
   const fingerprint = archiveSetFingerprint(rawParts);
-  const parts = rawParts.map((part, index) => ({ ...part, id: `archive-part:${part.manifestFingerprint}`, archiveId: archiveSetId(fingerprint), partIndex: index }));
+  const allowMediaOnly = results.some(result => result.supported && (result.format === 'html' || result.format === 'mixed'));
+  const mediaOnly = new Set(results.filter(result => result.metadataOnlyEligible && allowMediaOnly).flatMap(result => result.parts ?? []).map(part => part.manifestFingerprint));
+  const parts = rawParts.map((part, index) => ({ ...part, status: mediaOnly.has(part.manifestFingerprint) ? 'ready' as const : part.status, id: `archive-part:${part.manifestFingerprint}`, archiveId: archiveSetId(fingerprint), partIndex: index }));
   const formats = [...new Set(results.map(result => result.format ?? 'unknown'))];
   const format = formats.includes('mixed') || (formats.includes('json') && formats.includes('html')) ? 'mixed' : formats.includes('json') ? 'json' : formats.includes('html') ? 'html' : 'unknown';
   const sections = [...new Set(results.flatMap(result => result.sections))];
@@ -35,7 +37,7 @@ export function mergeDetectionResults(results: readonly DetectionResult[], dupli
     archiveSetFingerprint: fingerprint,
     totalSize,
     duplicateParts: [...duplicateNames],
-    unsupportedParts: results.flatMap(result => result.unsupportedParts ?? []),
+    unsupportedParts: results.filter(result => !(allowMediaOnly && result.metadataOnlyEligible)).flatMap(result => result.unsupportedParts ?? []),
     duplicatePaths: [...new Set(results.flatMap(result => result.duplicatePaths ?? []))],
     format,
   };

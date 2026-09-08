@@ -15,11 +15,11 @@ type State = {
   archiveParts: ArchivePart[];
   connectedPartIds: string[];
   imported: boolean;
-  storageMode?: 'opfs' | 'indexeddb';
+  storageMode?: 'opfs' | 'indexeddb' | 'memory';
   setArchive: (result: DetectionResult, descriptors: ArchiveSourceDescriptor[], imported?: boolean) => void;
   connectArchive: (result: DetectionResult, descriptors: ArchiveSourceDescriptor[]) => void;
   restoreArchive: (archiveSet: ArchiveSet | undefined, parts: ArchivePart[], identity?: ArchiveIdentity) => void;
-  markImported: (mode: 'opfs' | 'indexeddb') => void;
+  markImported: (mode: 'opfs' | 'indexeddb' | 'memory') => void;
   markImportIncomplete: () => void;
   releaseSources: (partIds?: readonly string[]) => void;
   clear: () => void;

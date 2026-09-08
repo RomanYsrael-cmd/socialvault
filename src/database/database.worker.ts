@@ -1,4 +1,7 @@
 /// <reference lib="webworker" />
+import { deferBrowsingIndexes, deferDerivedSearchIndexes, MESSAGE_BROWSING_INDEXES, restoreDerivedSearchIndexes } from './import-indexes';
+import { acquireDatabaseLock, openPooledDatabase } from './opfs';
+import { importMeter, metricsFromMeter } from '../archive/import-metrics';
 import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { clearFallbackImportState, getFallback, getFallbackImportState, getFallbackSnapshot, putFallback, putFallbackImportState, putFallbackSnapshot } from './indexeddb-fallback';
 import { FTS5_SCHEMA, MIGRATIONS, SCHEMA_VERSION } from './schema';
@@ -14,18 +17,25 @@ let sqliteRuntime: any;
 let mode: StorageMode = 'indexeddb';
 let searchBackend: SearchBackend = 'like';
 let storageFallbackReason: string | undefined;
+let storageVfs = 'memory';
 let fallbackData: NormalizedArchiveData | undefined;
 let batchesSinceFallback = 0;
 let derivedBatchesSinceFallback = 0;
 let databaseWriteDurationMs = 0;
 let databaseWriteBatchCount = 0;
+let databaseWriteRowCount = 0;
+let databaseWriteMaxDurationMs = 0;
+// Commit/finalization measurements are accumulated by the worker-wide meter.
+// Keep a session boundary so persisted diagnostics do not include work from a
+// prior archive import in the same worker.
+let databaseMetricBaseline: ReturnType<typeof metricsFromMeter> | undefined;
 let activeDerivedSession: string | undefined;
 let derivedCancelRequested = false;
 let fallbackSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let fallbackSnapshotRunning = false;
 let fallbackSnapshotRequested = false;
 
-const send = (message: DatabaseResponse | DatabaseProgress) => postMessage(message);
+const send = (message: DatabaseResponse | DatabaseProgress) => { postMessage(message); if ('id' in message) postMessage({ type: 'pipeline-metrics', metrics: importMeter.snapshot() }); };
 const sendDerivedProgress = (requestId: number, kind: 'search' | 'activity', phase: string, status: DatabaseProgress['status'], rowsProcessed: number, totalRows: number, message: string) => postMessage({ type: 'progress', requestId, kind, phase, status, rowsProcessed, totalRows, message } satisfies DatabaseProgress);
 const rows = (sql: string, bind: unknown[] = []): Record<string, unknown>[] => db.exec({ sql, bind, returnValue: 'resultRows', rowMode: 'object' } as Record<string, unknown>) as Record<string, unknown>[];
 function databaseSizeBytes() {
@@ -42,7 +52,7 @@ function databaseSizeBytes() {
  * actionable failure with "cannot rollback - no transaction is active". */
 const transaction = (work: () => void) => {
   db.exec('BEGIN');
-  try { work(); db.exec('COMMIT'); }
+  try { work(); const commitStart = performance.now(); db.exec('COMMIT'); importMeter.add('commit', performance.now() - commitStart); }
   catch (error) { try { db.exec('ROLLBACK'); } catch { /* preserve original error */ } throw error; }
 };
 function deserializeSnapshot(target: DB, snapshot: Uint8Array) {
@@ -61,7 +71,7 @@ function switchToIndexedDbFallback(preserve = true) {
     let memory: DB | undefined;
     try {
       memory = new sqliteRuntime.oo1.DB(':memory:', 'c') as DB;
-      db = memory; mode = 'indexeddb'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.';
+      db = memory; mode = 'indexeddb'; storageVfs = 'indexeddb-memory'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.';
       // The fresh connection does not contain the OPFS schema. Initialize it
       // before the caller starts writing import checkpoints or normalized rows.
       applyMigrations(); setupSearch();
@@ -80,7 +90,7 @@ function switchToIndexedDbFallback(preserve = true) {
   // connection alive and surface the storage error to the caller.
   if (!snapshot?.byteLength || !deserializeSnapshot(memory, snapshot)) { try { memory.close?.(); } catch { /* ignore cleanup failure */ } return false; }
   try { previous.close?.(); } catch { /* preserve the readable in-memory copy */ }
-  db = memory; mode = 'indexeddb'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.'; batchesSinceFallback = 0; derivedBatchesSinceFallback = 0;
+  db = memory; mode = 'indexeddb'; storageVfs = 'indexeddb-memory'; storageFallbackReason = 'OPFS write failed; using an IndexedDB snapshot fallback.'; batchesSinceFallback = 0; derivedBatchesSinceFallback = 0;
   return true;
 }
 async function withStorageFallback<T>(work: () => T | Promise<T>): Promise<T> {
@@ -103,6 +113,8 @@ let sqliteBatchSize = SQLITE_BATCH_SIZE;
  * records keeps structured-clone payloads small while avoiding one SQLite
  * transaction per HTML card. Derived SQL jobs use the same upper bound. */
 const DERIVED_BATCH_SIZE = 5000;
+const DERIVED_MIN_BATCH_SIZE = 1000;
+const DERIVED_DIAGNOSTIC_STAGES = new Set(['browsing-indexes', 'search-documents', 'fts-indexing', 'activity-derivation', 'fallback-snapshot']);
 /** Keep SQLite writes bounded while avoiding one worker round-trip per record.
  * 2000 rows stays below SQLite's default variable limit even for the widest
  * normalized table (15 columns) while making large HTML imports materially
@@ -199,6 +211,10 @@ function restoreImportState(state?: ImportState) {
 
 function setupSearch() {
   try { db.exec(FTS5_SCHEMA); searchBackend = 'fts5'; } catch { searchBackend = 'like'; }
+  // A terminated derived job may have been interrupted after dropping the
+  // browse-only search indexes. Recreate them before serving queries; an
+  // active rebuild drops them again for the duration of its own writes.
+  try { restoreDerivedSearchIndexes(sql => db.exec(sql)); } catch { /* LIKE/FTS remains usable without optional indexes */ }
 }
 
 function normalizedData(data: Partial<NormalizedArchiveData>): NormalizedArchiveData {
@@ -322,10 +338,16 @@ function replace(input: NormalizedArchiveData) {
 
 const ARCHIVE_DATA_TABLES = ['activity_records', 'comments', 'reactions', 'album_media', 'albums', 'profile_facts', 'messages', 'conversations', 'posts', 'profiles', 'media', 'people', 'person_sources', 'source_records', 'import_metadata', 'archive_identity', 'archive_parts', 'archive_sets', 'import_part_checkpoints', 'import_section_status', 'diagnostic_warning_groups', 'derived_index_jobs', 'import_sessions'];
 function clearArchiveData() {
+  db.exec('DELETE FROM import_source_checkpoints');
   transaction(() => ARCHIVE_DATA_TABLES.forEach(table => db.exec(`DELETE FROM ${table}`)));
   db.exec('DELETE FROM search_documents');
   if (searchBackend === 'fts5') db.exec('DELETE FROM archive_fts');
   fallbackData = undefined;
+  databaseMetricBaseline = undefined;
+  databaseWriteDurationMs = 0;
+  databaseWriteBatchCount = 0;
+  databaseWriteRowCount = 0;
+  databaseWriteMaxDurationMs = 0;
 }
 
 const sectionPriority: Record<ImportSectionStatus['status'], number> = { detected: 1, imported: 2, partial: 3, malformed: 4, unsupported: 4, skipped: 4 };
@@ -424,7 +446,7 @@ function importPartData(dataInput: NormalizedArchiveData, part: ArchivePart, ses
       const prior = rows('SELECT source_paths sourcePaths FROM people WHERE id=?', [person.id])[0];
       const sourcePaths = [...new Set([...json<string[]>(prior?.sourcePaths, []), ...(person.sourcePaths ?? [])])];
       db.exec({ sql: 'INSERT OR REPLACE INTO people(id,facebook_id,display_name,username,profile_url,profile_photo_path,cover_photo_path,first_seen,last_seen,relationship,identity_confidence,identity_source,source_paths,is_archive_owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', bind: [person.id, person.facebookId ?? null, person.displayName, person.username ?? null, person.profileUrl ?? null, person.profilePhotoPath ?? null, person.coverPhotoPath ?? null, person.firstSeen ?? null, person.lastSeen ?? null, person.relationship ?? null, person.identityConfidence ?? null, person.identitySource ?? null, JSON.stringify(sourcePaths), person.isArchiveOwner ? 1 : 0] });
-      sourcePaths.forEach(path => db.exec({ sql: 'INSERT OR IGNORE INTO person_sources(person_id,source_path,source_index,archive_part_id) VALUES(?,?,?,?)', bind: [person.id, path, null, part.id] }));
+      (person.sourcePaths ?? []).forEach(path => db.exec({ sql: 'INSERT INTO person_sources(person_id,source_path,source_index,archive_part_id) SELECT ?,?,NULL,? WHERE NOT EXISTS (SELECT 1 FROM person_sources WHERE person_id=? AND source_path=? AND archive_part_id=?)', bind: [person.id, path, part.id, person.id, path, part.id] }));
     }
     batchInsert('posts', ['id', 'author_id', 'title', 'body', 'created_at', 'links', 'source_path', 'source_index', 'archive_part_id'], data.posts.map(post => [post.id, post.authorId ?? null, post.title ?? null, post.text ?? null, post.createdAt ?? null, JSON.stringify(post.links ?? []), post.source.path, post.source.index ?? null, part.id]), 'OR IGNORE');
     batchInsert('comments', ['id', 'post_id', 'author_id', 'author_name', 'body', 'created_at', 'source_path', 'source_index', 'archive_part_id'], data.comments.map(comment => [comment.id, comment.postId, comment.authorId ?? null, comment.authorName ?? null, comment.text, comment.createdAt ?? null, comment.source.path, comment.source.index ?? null, part.id]), 'OR IGNORE');
@@ -456,32 +478,71 @@ function importPartData(dataInput: NormalizedArchiveData, part: ArchivePart, ses
     // the media primary key; a path lookup would scan the growing media table
     // once per reference and turns large HTML imports into an O(n²) workload.
     for (const item of data.media) if (item.source.archivePartId && item.source.archivePartId !== part.id) db.exec({ sql: 'UPDATE media SET archive_part_id=? WHERE id=?', bind: [item.source.archivePartId, item.id] });
+    const checkpointStarted = performance.now();
+    batchInsert('import_source_checkpoints', ['session_id','archive_part_id','source_path','parser_version'], (data.completedSourcePaths ?? []).map(path => [sessionId, part.id, path, FACEBOOK_PARSER_VERSION]), 'OR IGNORE');
     if (finalize) db.exec({ sql: 'INSERT OR REPLACE INTO import_part_checkpoints(session_id,archive_part_id,part_index,manifest_fingerprint,status,started_at,updated_at,completed_at,parser_version,record_counts,warnings_count,sections) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', bind: [sessionId, part.id, part.partIndex, part.manifestFingerprint, 'complete', now, now, now, FACEBOOK_PARSER_VERSION, JSON.stringify(recordCounts), partWarningCount, JSON.stringify(data.importedSections ?? part.sections ?? [])] });
+    importMeter.add('checkpoint', performance.now() - checkpointStarted, (data.completedSourcePaths?.length ?? 0) + (finalize ? 1 : 0));
   });
   const persistDurationMs = performance.now() - persistStartedAt;
+  importMeter.add('base-write', persistDurationMs, Object.values(recordCounts).reduce((sum, value) => sum + value, 0));
   databaseWriteDurationMs += persistDurationMs;
   databaseWriteBatchCount += 1;
+  databaseWriteRowCount += Object.values(recordCounts).reduce((sum, value) => sum + value, 0);
+  databaseWriteMaxDurationMs = Math.max(databaseWriteMaxDurationMs, persistDurationMs);
   if (persistDurationMs > 300) sqliteBatchSize = Math.max(SQLITE_MIN_BATCH_SIZE, Math.floor(sqliteBatchSize * 0.75));
   else if (persistDurationMs < 60) sqliteBatchSize = Math.min(SQLITE_MAX_BATCH_SIZE, sqliteBatchSize + 250);
+  const finalizationStarted = performance.now();
   const state = finalize ? currentImportState(sessionId) : undefined; if (finalize && state?.session) {
     const counts = { ...emptyCounts() }; for (const [key, table] of Object.entries({ profiles: 'profiles', people: 'people', posts: 'posts', comments: 'comments', reactions: 'reactions', connections: 'connections', albums: 'albums', conversations: 'conversations', messages: 'messages', media: 'media', activities: 'activity_records' })) counts[key as keyof ImportCounts] = Number(rows(`SELECT COUNT(*) count FROM ${table}`)[0]?.count ?? 0);
     const checkpoints = state.checkpoints; const failed = checkpoints.filter(item => item.status === 'failed'); const skipped = checkpoints.filter(item => item.status === 'skipped');
     const previousMetrics = state.session.metrics ?? {}; const partDuration = data.performance?.totalDurationMs ?? data.diagnostics?.performance?.totalDurationMs; const sectionCounts = { ...(previousMetrics.sectionCounts ?? {}) }; for (const [section, value] of Object.entries(data.performance?.sectionCounts ?? {})) sectionCounts[section] = (sectionCounts[section] ?? 0) + value;
-    const stageDurationsMs = { ...(previousMetrics.stageDurationsMs ?? {}), database: Math.round((previousMetrics.stageDurationsMs?.database ?? 0) + databaseWriteDurationMs) };
-    const stageCounts = { ...(previousMetrics.stageCounts ?? {}), databaseBatches: (previousMetrics.stageCounts?.databaseBatches ?? 0) + databaseWriteBatchCount };
-    upsertSession({ ...state.session, updatedAt: now, currentStage: 'parsing', status: 'importing', importedPartCount: checkpoints.filter(item => item.status === 'complete').length, failedPartCount: failed.length, skippedPartCount: skipped.length, normalizedCounts: counts, warningsCount: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), failedPartIds: failed.map(item => item.archivePartId), skippedPartIds: skipped.map(item => item.archivePartId), sourceStatus: 'importing', derivedStatus: 'pending', derivedPhase: undefined, derivedRows: 0, derivedTotal: 0, derivedUpdatedAt: now, derivedError: undefined, metrics: { ...previousMetrics, totalDurationMs: (previousMetrics.totalDurationMs ?? 0) + (partDuration ?? 0), partDurationsMs: { ...(previousMetrics.partDurationsMs ?? {}), [part.id]: partDuration ?? 0 }, sectionCounts, stageDurationsMs, stageCounts, batchSize: Math.max(previousMetrics.batchSize ?? 0, data.performance?.batchSize ?? 0) || undefined, batchCount: (previousMetrics.batchCount ?? 0) + (data.performance?.batchCount ?? 0), maxBatchRecords: Math.max(previousMetrics.maxBatchRecords ?? 0, data.performance?.maxBatchRecords ?? 0) || undefined, maxBatchBytes: Math.max(previousMetrics.maxBatchBytes ?? 0, data.performance?.maxBatchBytes ?? 0) || undefined } });
+    const stageDurationsMs = { ...(previousMetrics.stageDurationsMs ?? {}), database: Math.round((previousMetrics.stageDurationsMs?.database ?? 0) + databaseWriteDurationMs), 'base-write': Math.round((previousMetrics.stageDurationsMs?.['base-write'] ?? 0) + databaseWriteDurationMs) };
+    const stageCounts = { ...(previousMetrics.stageCounts ?? {}), databaseBatches: (previousMetrics.stageCounts?.databaseBatches ?? 0) + databaseWriteBatchCount, 'base-write': (previousMetrics.stageCounts?.['base-write'] ?? 0) + databaseWriteBatchCount };
+    const stageRows = { ...(previousMetrics.stageRows ?? {}), database: (previousMetrics.stageRows?.database ?? 0) + databaseWriteRowCount, 'base-write': (previousMetrics.stageRows?.['base-write'] ?? 0) + databaseWriteRowCount };
+    const stageBytes = { ...(previousMetrics.stageBytes ?? {}) };
+    const stageMaxLatencyMs = { ...(previousMetrics.stageMaxLatencyMs ?? {}), database: Math.max(previousMetrics.stageMaxLatencyMs?.database ?? 0, Math.round(databaseWriteMaxDurationMs)), 'base-write': Math.max(previousMetrics.stageMaxLatencyMs?.['base-write'] ?? 0, Math.round(databaseWriteMaxDurationMs)) };
+    const slowSectionTotals = new Map<string, number>(); for (const item of previousMetrics.slowestSections ?? []) slowSectionTotals.set(item.section, item.durationMs); for (const item of (data.performance?.slowestSections ?? [])) slowSectionTotals.set(item.section, (slowSectionTotals.get(item.section) ?? 0) + item.durationMs);
+    const slowestSections = [...slowSectionTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([section, durationMs]) => ({ section, durationMs }));
+    upsertSession({ ...state.session, updatedAt: now, currentStage: 'parsing', status: 'importing', importedPartCount: checkpoints.filter(item => item.status === 'complete').length, failedPartCount: failed.length, skippedPartCount: skipped.length, normalizedCounts: counts, warningsCount: Number(rows("SELECT value FROM import_metadata WHERE key='warning_count'")[0]?.value ?? 0), failedPartIds: failed.map(item => item.archivePartId), skippedPartIds: skipped.map(item => item.archivePartId), sourceStatus: 'importing', derivedStatus: 'pending', derivedPhase: undefined, derivedRows: 0, derivedTotal: 0, derivedUpdatedAt: now, derivedError: undefined, metrics: { ...previousMetrics, totalDurationMs: (previousMetrics.totalDurationMs ?? 0) + (partDuration ?? 0), partDurationsMs: { ...(previousMetrics.partDurationsMs ?? {}), [part.id]: partDuration ?? 0 }, sectionCounts, slowestSections, stageDurationsMs, stageCounts, stageRows, stageBytes, stageMaxLatencyMs, batchSize: Math.max(previousMetrics.batchSize ?? 0, data.performance?.batchSize ?? 0) || undefined, batchCount: (previousMetrics.batchCount ?? 0) + (data.performance?.batchCount ?? 0), maxBatchRecords: Math.max(previousMetrics.maxBatchRecords ?? 0, data.performance?.maxBatchRecords ?? 0) || undefined, maxBatchBytes: Math.max(previousMetrics.maxBatchBytes ?? 0, data.performance?.maxBatchBytes ?? 0) || undefined } });
     databaseWriteDurationMs = 0;
     databaseWriteBatchCount = 0;
+    databaseWriteRowCount = 0;
+    databaseWriteMaxDurationMs = 0;
   }
-  if (finalize && data.performance) {
+  importMeter.add('finalization', performance.now() - finalizationStarted);
+  if (finalize) {
     const persisted = currentImportState(sessionId).session;
     if (persisted) {
       const metrics = persisted.metrics ?? {};
       const stageDurationsMs = { ...(metrics.stageDurationsMs ?? {}) };
-      for (const [stage, duration] of Object.entries(data.performance.stageDurationsMs ?? {})) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + duration;
+      for (const [stage, duration] of Object.entries(data.performance?.stageDurationsMs ?? {})) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + duration;
       const stageCounts = { ...(metrics.stageCounts ?? {}) };
-      for (const [stage, count] of Object.entries(data.performance.stageCounts ?? {})) stageCounts[stage] = (stageCounts[stage] ?? 0) + count;
-      upsertSession({ ...persisted, metrics: { ...metrics, stageDurationsMs, stageCounts } });
+      for (const [stage, count] of Object.entries(data.performance?.stageCounts ?? {})) stageCounts[stage] = (stageCounts[stage] ?? 0) + count;
+      const stageRows = { ...(metrics.stageRows ?? {}) };
+      for (const [stage, count] of Object.entries(data.performance?.stageRows ?? {})) stageRows[stage] = (stageRows[stage] ?? 0) + count;
+      const stageBytes = { ...(metrics.stageBytes ?? {}) };
+      for (const [stage, count] of Object.entries(data.performance?.stageBytes ?? {})) stageBytes[stage] = (stageBytes[stage] ?? 0) + count;
+      const stageMaxLatencyMs = { ...(metrics.stageMaxLatencyMs ?? {}) };
+      for (const [stage, latency] of Object.entries(data.performance?.stageMaxLatencyMs ?? {})) stageMaxLatencyMs[stage] = Math.max(stageMaxLatencyMs[stage] ?? 0, latency);
+      // Commit and finalization happen in the database worker, so they are
+      // not part of the parser payload's performance map. Persist the delta
+      // from the start of this import session for a complete stage breakdown.
+      const meterMetrics = metricsFromMeter();
+      const baseline = databaseMetricBaseline ?? meterMetrics;
+      for (const stage of ['commit', 'finalization'] as const) {
+        const durationDelta = (meterMetrics.stageDurationsMs?.[stage] ?? 0) - (baseline.stageDurationsMs?.[stage] ?? 0);
+        const countDelta = (meterMetrics.stageCounts?.[stage] ?? 0) - (baseline.stageCounts?.[stage] ?? 0);
+        const rowDelta = (meterMetrics.stageRows?.[stage] ?? 0) - (baseline.stageRows?.[stage] ?? 0);
+        const byteDelta = (meterMetrics.stageBytes?.[stage] ?? 0) - (baseline.stageBytes?.[stage] ?? 0);
+        if (durationDelta > 0) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + Math.round(durationDelta);
+        if (countDelta > 0) stageCounts[stage] = (stageCounts[stage] ?? 0) + countDelta;
+        if (rowDelta > 0) stageRows[stage] = (stageRows[stage] ?? 0) + rowDelta;
+        if (byteDelta > 0) stageBytes[stage] = (stageBytes[stage] ?? 0) + byteDelta;
+        if ((meterMetrics.stageMaxLatencyMs?.[stage] ?? 0) > 0) stageMaxLatencyMs[stage] = Math.max(stageMaxLatencyMs[stage] ?? 0, meterMetrics.stageMaxLatencyMs?.[stage] ?? 0);
+      }
+      const slowestFiles = [...(metrics.slowestFiles ?? []), ...(data.performance?.slowestFiles ?? [])].sort((a, b) => b.ms - a.ms).slice(0, 10);
+      upsertSession({ ...persisted, metrics: { ...metrics, stageDurationsMs, stageCounts, stageRows, stageBytes, stageMaxLatencyMs, slowestFiles } });
+      databaseMetricBaseline = meterMetrics;
     }
   }
   if (finalize) resetDerivedJobs(sessionId, true);
@@ -510,6 +571,7 @@ function beginImportSession(sessionInput?: ImportSession, parts: ArchivePart[] =
   const existingSet = rows('SELECT id FROM archive_sets ORDER BY created_at DESC LIMIT 1')[0];
   if (existingSet && String(existingSet.id) !== set.id) clearArchiveData();
   const session: ImportSession = sessionInput ?? { id: sessionIdForArchive(set.id), archiveSetId: set.id, startedAt: now, updatedAt: now, parserVersion: FACEBOOK_PARSER_VERSION, schemaVersion: SCHEMA_VERSION, expectedPartCount: parts.length || set.partCount, inspectedPartCount: 0, importedPartCount: 0, failedPartCount: 0, skippedPartCount: 0, currentStage: 'inspection', status: 'new', normalizedCounts: emptyCounts(), warningsCount: 0, detectedSections: [], importedSections: [], sourceStatus: 'pending', derivedStatus: 'pending' };
+  if (session.sourceStatus !== 'complete') deferBrowsingIndexes(sql => db.exec(sql));
   const existingIdentity = identityFromRow(rows('SELECT filename,size,entry_count entryCount,fingerprint,known_entries knownEntries FROM archive_identity WHERE id=1')[0]);
   const identity: ArchiveIdentity | undefined = archiveIdentity ?? (existingIdentity?.fingerprint === set.fingerprint ? existingIdentity : parts.length ? {
     filename: parts.length === 1 ? parts[0].filename : `${parts.length} Facebook ZIP parts`,
@@ -526,6 +588,13 @@ function beginImportSession(sessionInput?: ImportSession, parts: ArchivePart[] =
     for (const part of parts) db.exec({ sql: 'INSERT OR REPLACE INTO archive_parts(id,archive_id,part_index,filename,file_size,entry_count,manifest_fingerprint,connected,status,warning_count,sections,source_format) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', bind: [part.id, set.id, part.partIndex, part.filename, part.fileSize, part.entryCount, part.manifestFingerprint, part.connected ? 1 : 0, part.status ?? 'pending', part.warningCount ?? 0, JSON.stringify(part.sections ?? []), part.sourceFormat ?? set.sourceFormat ?? null] });
     for (const kind of ['search', 'activity'] as const) db.exec({ sql: 'INSERT OR IGNORE INTO derived_index_jobs(session_id,kind,status,phase,cursor,rows_processed,total_rows,batch_size,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)', bind: [session.id, kind, 'pending', 'pending', null, 0, 0, DERIVED_BATCH_SIZE, now, now] });
   });
+  // Exclude the session-seeding transaction from the import commit timing.
+  // This also makes a resumed session measure only the new work after reload.
+  databaseMetricBaseline = metricsFromMeter();
+  databaseWriteDurationMs = 0;
+  databaseWriteBatchCount = 0;
+  databaseWriteRowCount = 0;
+  databaseWriteMaxDurationMs = 0;
   // Keep archive identity and part metadata in the IndexedDB snapshot even if
   // cancellation happens before the first normalized batch is acknowledged.
   // Without this seed, a reload could restore records but lose the resumable
@@ -625,16 +694,16 @@ function runRebuildJob<T extends RebuildResult>(kind: T['kind'], work: () => T):
 type DerivedPhase = { name: string; table: string; where?: string; countSql: string; insertSql: string; label: string };
 const derivedWhere = (where: string | undefined) => where ? `WHERE ${where} AND rowid>?` : 'WHERE rowid>?';
 const searchPhases = (): DerivedPhase[] => [
-  { name: 'people', table: 'people', countSql: 'SELECT COUNT(*) count FROM people', label: 'people', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'person',id,display_name,trim(COALESCE(username,'')||' '||COALESCE(relationship,'')),facebook_id,NULL,NULL,COALESCE(identity_source,json_extract(source_paths,'$[0]')) FROM people WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'profile-facts', table: 'profile_facts', countSql: 'SELECT COUNT(*) count FROM profile_facts', label: 'profile facts', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'profile-fact','fact:'||id,category,trim(COALESCE(label,'')||' '||value),trim(COALESCE(start_date,'')||' '||COALESCE(end_date,'')),COALESCE(start_date,end_date),NULL,source_path FROM profile_facts WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'posts', table: 'posts', countSql: 'SELECT COUNT(*) count FROM posts', label: 'posts', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'post',id,title,body,trim(COALESCE(created_at,'')||' '||COALESCE(links,'')),created_at,NULL,source_path FROM posts WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'comments', table: 'comments', countSql: 'SELECT COUNT(*) count FROM comments', label: 'comments', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'comment',id,author_name,body,post_id,created_at,NULL,source_path FROM comments WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'reactions', table: 'reactions', countSql: 'SELECT COUNT(*) count FROM reactions', label: 'reactions', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'reaction',id,kind,person_name,target_id,created_at,NULL,source_path FROM reactions WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'connections', table: 'connections', countSql: 'SELECT COUNT(*) count FROM connections', label: 'connections', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'connection',id,display_name,trim(COALESCE(relationship_type,'')||' '||COALESCE(username,'')),COALESCE(started_at,ended_at),COALESCE(started_at,ended_at),NULL,source_path FROM connections WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'albums', table: 'albums', countSql: 'SELECT COUNT(*) count FROM albums', label: 'albums', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'album',id,title,description,created_at,COALESCE(updated_at,created_at),NULL,source_path FROM albums WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'media', table: 'media', countSql: 'SELECT COUNT(*) count FROM media', label: 'media metadata', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'media',id,COALESCE(filename,path),caption,path,timestamp,NULL,source_path FROM media WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'conversations', table: 'conversations', countSql: 'SELECT COUNT(*) count FROM conversations', label: 'conversations', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'conversation',id,COALESCE(title,'Conversation'),participant_names,participant_names,NULL,NULL,source_path FROM conversations WHERE rowid>? ORDER BY rowid LIMIT ?` },
-  { name: 'messages', table: 'messages', countSql: 'SELECT COUNT(*) count FROM messages', label: 'messages', insertSql: `INSERT OR REPLACE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'message',m.id,COALESCE(c.title,'Conversation'),m.body,trim(COALESCE(m.sender_name,'')||' '||COALESCE(m.sent_at,'')),m.sent_at,m.conversation_id,m.source_path FROM messages m LEFT JOIN conversations c ON c.id=m.conversation_id WHERE m.rowid>? ORDER BY m.rowid LIMIT ?` },
+  { name: 'people', table: 'people', countSql: 'SELECT COUNT(*) count FROM people', label: 'people', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'person',id,display_name,trim(COALESCE(username,'')||' '||COALESCE(relationship,'')),facebook_id,NULL,NULL,COALESCE(identity_source,json_extract(source_paths,'$[0]')) FROM people WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'profile-facts', table: 'profile_facts', countSql: 'SELECT COUNT(*) count FROM profile_facts', label: 'profile facts', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'profile-fact','fact:'||id,category,trim(COALESCE(label,'')||' '||value),trim(COALESCE(start_date,'')||' '||COALESCE(end_date,'')),COALESCE(start_date,end_date),NULL,source_path FROM profile_facts WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'posts', table: 'posts', countSql: 'SELECT COUNT(*) count FROM posts', label: 'posts', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'post',id,title,body,trim(COALESCE(created_at,'')||' '||COALESCE(links,'')),created_at,NULL,source_path FROM posts WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'comments', table: 'comments', countSql: 'SELECT COUNT(*) count FROM comments', label: 'comments', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'comment',id,author_name,body,post_id,created_at,NULL,source_path FROM comments WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'reactions', table: 'reactions', countSql: 'SELECT COUNT(*) count FROM reactions', label: 'reactions', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'reaction',id,kind,person_name,target_id,created_at,NULL,source_path FROM reactions WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'connections', table: 'connections', countSql: 'SELECT COUNT(*) count FROM connections', label: 'connections', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'connection',id,display_name,trim(COALESCE(relationship_type,'')||' '||COALESCE(username,'')),COALESCE(started_at,ended_at),COALESCE(started_at,ended_at),NULL,source_path FROM connections WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'albums', table: 'albums', countSql: 'SELECT COUNT(*) count FROM albums', label: 'albums', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'album',id,title,description,created_at,COALESCE(updated_at,created_at),NULL,source_path FROM albums WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'media', table: 'media', countSql: 'SELECT COUNT(*) count FROM media', label: 'media metadata', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'media',id,COALESCE(filename,path),caption,path,timestamp,NULL,source_path FROM media WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'conversations', table: 'conversations', countSql: 'SELECT COUNT(*) count FROM conversations', label: 'conversations', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'conversation',id,COALESCE(title,'Conversation'),participant_names,participant_names,NULL,NULL,source_path FROM conversations WHERE rowid>? ORDER BY rowid LIMIT ?` },
+  { name: 'messages', table: 'messages', countSql: 'SELECT COUNT(*) count FROM messages', label: 'messages', insertSql: `INSERT OR IGNORE INTO search_documents(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT 'message',m.id,COALESCE(c.title,'Conversation'),m.body,trim(COALESCE(m.sender_name,'')||' '||COALESCE(m.sent_at,'')),m.sent_at,m.conversation_id,m.source_path FROM messages m LEFT JOIN conversations c ON c.id=m.conversation_id WHERE m.rowid>? ORDER BY m.rowid LIMIT ?` },
   { name: 'fts', table: 'search_documents', countSql: 'SELECT COUNT(*) count FROM search_documents', label: 'FTS5 index', insertSql: `INSERT INTO archive_fts(entity_type,entity_id,title,body,context,created_at,conversation_id,source_path) SELECT entity_type,entity_id,title,body,context,created_at,conversation_id,source_path FROM search_documents WHERE rowid>? ORDER BY rowid LIMIT ?` },
 ];
 const activityPhases = (): DerivedPhase[] => {
@@ -692,8 +761,12 @@ async function runDerivedIndex(kind: 'search' | 'activity', requestId: number, f
   if (force) { resetDerivedTarget(session.id, kind, totalRows); job = derivedFromRow(derivedJobRow(session.id, kind)!); }
   if (job.status === 'complete') return { kind, rows: job.rowsProcessed, completedAt: job.completedAt ?? new Date().toISOString() };
   activeDerivedSession = session.id; derivedCancelRequested = false; derivedBatchesSinceFallback = 0;
+  const metricBaseline = metricsFromMeter();
+  let searchIndexesDeferred = false;
+  if (kind === 'search') { deferDerivedSearchIndexes(sql => db.exec(sql)); searchIndexesDeferred = true; }
+  if (kind === 'search') for (const [name, definition] of Object.entries(MESSAGE_BROWSING_INDEXES)) { sendDerivedProgress(requestId, kind, 'browsing-indexes', 'running', 0, totalRows, 'Preparing message browsing indexes…'); const started = performance.now(); db.exec(`CREATE INDEX IF NOT EXISTS ${name} ON ${definition}`); importMeter.add('browsing-indexes', performance.now() - started); await waitForWorkerTurn(); if (derivedCancelRequested) throw new Error('__SOCIALVAULT_DERIVED_CANCELLED__'); }
   const startedMs = performance.now(); const phaseStart = Math.max(0, phases.findIndex(phase => phase.name === job.phase));
-  let batchSize = Math.min(10_000, Math.max(SQLITE_MIN_BATCH_SIZE, job.batchSize || DERIVED_BATCH_SIZE));
+  let batchSize = Math.min(10_000, Math.max(DERIVED_MIN_BATCH_SIZE, job.batchSize || DERIVED_BATCH_SIZE));
   try {
     db.exec({ sql: 'UPDATE derived_index_jobs SET status=?,updated_at=?,error=NULL WHERE session_id=? AND kind=?', bind: ['running', new Date().toISOString(), session.id, kind] });
     job = derivedFromRow(derivedJobRow(session.id, kind)!); updateDerivedSession(session.id, kind, job, 'running');
@@ -719,7 +792,9 @@ async function runDerivedIndex(kind: 'search' | 'activity', requestId: number, f
         });
         cursor = lastRowId;
         const batchDurationMs = performance.now() - batchStartedAt;
-        const nextBatchSize = batchDurationMs > 300 ? Math.max(SQLITE_MIN_BATCH_SIZE, Math.floor(batchSize * 0.75)) : batchDurationMs < 60 && selected.length === batchSize ? Math.min(10_000, batchSize + 500) : batchSize;
+        importMeter.add(kind === 'activity' ? 'activity-derivation' : phase.name === 'fts' ? 'fts-indexing' : 'search-documents', batchDurationMs, selected.length);
+        postMessage({ type: 'pipeline-metrics', metrics: importMeter.snapshot() });
+        const nextBatchSize = batchDurationMs > 1_500 ? Math.max(DERIVED_MIN_BATCH_SIZE, Math.floor(batchSize * 0.75)) : batchDurationMs < 250 && selected.length === batchSize ? Math.min(10_000, batchSize + 500) : batchSize;
         if (nextBatchSize !== batchSize) { batchSize = nextBatchSize; db.exec({ sql: 'UPDATE derived_index_jobs SET batch_size=?,updated_at=? WHERE session_id=? AND kind=?', bind: [batchSize, new Date().toISOString(), session.id, kind] }); }
         job = derivedFromRow(derivedJobRow(session.id, kind)!); updateDerivedSession(session.id, kind, job, 'running');
         sendDerivedProgress(requestId, kind, phase.name, 'running', job.rowsProcessed, job.totalRows, `Indexing ${phase.label}…`);
@@ -728,7 +803,7 @@ async function runDerivedIndex(kind: 'search' | 'activity', requestId: number, f
         // needs periodic serialized snapshots as well, otherwise a browser
         // restart during a long derived pass would lose every checkpoint
         // since the previous completed request.
-        if (mode === 'indexeddb' && derivedBatchesSinceFallback >= 16) { derivedBatchesSinceFallback = 0; await persistFallback(true); }
+        if (mode === 'indexeddb' && derivedBatchesSinceFallback >= 256) { derivedBatchesSinceFallback = 0; await persistFallback(true); }
         await waitForWorkerTurn();
       }
       if (phaseIndex + 1 < phases.length) {
@@ -739,14 +814,34 @@ async function runDerivedIndex(kind: 'search' | 'activity', requestId: number, f
     if (kind === 'search') db.exec('PRAGMA optimize');
     const completedAt = new Date().toISOString(); db.exec({ sql: 'UPDATE derived_index_jobs SET status=?,updated_at=?,completed_at=?,cursor=NULL,error=NULL WHERE session_id=? AND kind=?', bind: ['complete', completedAt, completedAt, session.id, kind] });
     job = derivedFromRow(derivedJobRow(session.id, kind)!); updateDerivedSession(session.id, kind, job, 'complete');
-    const elapsed = Math.max(1, performance.now() - startedMs); const current = currentImportState(session.id).session; if (current) upsertSession({ ...current, metrics: { ...(current.metrics ?? {}), derivedDurationsMs: { ...(current.metrics?.derivedDurationsMs ?? {}), [kind]: Math.round(elapsed) }, derivedRows: { ...(current.metrics?.derivedRows ?? {}), [kind]: job.rowsProcessed } } });
+    const elapsed = Math.max(1, performance.now() - startedMs); const current = currentImportState(session.id).session;
+    if (current) {
+      const meterMetrics = metricsFromMeter();
+      const stageDurationsMs = { ...(current.metrics?.stageDurationsMs ?? {}) };
+      const stageCounts = { ...(current.metrics?.stageCounts ?? {}) };
+      const stageRows = { ...(current.metrics?.stageRows ?? {}) };
+      const stageBytes = { ...(current.metrics?.stageBytes ?? {}) };
+      const stageMaxLatencyMs = { ...(current.metrics?.stageMaxLatencyMs ?? {}) };
+      for (const stage of DERIVED_DIAGNOSTIC_STAGES) {
+        const durationDelta = (meterMetrics.stageDurationsMs?.[stage] ?? 0) - (metricBaseline.stageDurationsMs?.[stage] ?? 0);
+        const countDelta = (meterMetrics.stageCounts?.[stage] ?? 0) - (metricBaseline.stageCounts?.[stage] ?? 0);
+        const rowDelta = (meterMetrics.stageRows?.[stage] ?? 0) - (metricBaseline.stageRows?.[stage] ?? 0);
+        const byteDelta = (meterMetrics.stageBytes?.[stage] ?? 0) - (metricBaseline.stageBytes?.[stage] ?? 0);
+        if (durationDelta > 0) stageDurationsMs[stage] = (stageDurationsMs[stage] ?? 0) + Math.round(durationDelta);
+        if (countDelta > 0) stageCounts[stage] = (stageCounts[stage] ?? 0) + countDelta;
+        if (rowDelta > 0) stageRows[stage] = (stageRows[stage] ?? 0) + rowDelta;
+        if (byteDelta > 0) stageBytes[stage] = (stageBytes[stage] ?? 0) + byteDelta;
+        if ((meterMetrics.stageMaxLatencyMs?.[stage] ?? 0) > 0) stageMaxLatencyMs[stage] = Math.max(stageMaxLatencyMs[stage] ?? 0, meterMetrics.stageMaxLatencyMs?.[stage] ?? 0);
+      }
+      upsertSession({ ...current, metrics: { ...(current.metrics ?? {}), stageDurationsMs, stageCounts, stageRows, stageBytes, stageMaxLatencyMs, derivedDurationsMs: { ...(current.metrics?.derivedDurationsMs ?? {}), [kind]: Math.round(elapsed) }, derivedRows: { ...(current.metrics?.derivedRows ?? {}), [kind]: job.rowsProcessed } } });
+    }
     sendDerivedProgress(requestId, kind, 'complete', 'complete', job.rowsProcessed, job.totalRows, `Local ${kind} index ready.`);
     return { kind, rows: job.rowsProcessed, completedAt };
   } catch (error) {
     const cancelled = error instanceof Error && error.message === '__SOCIALVAULT_DERIVED_CANCELLED__'; const status: DerivedIndexStatus = cancelled ? 'interrupted' : 'failed'; const message = cancelled ? 'Derived indexing paused. It can resume from the last checkpoint.' : error instanceof Error ? error.message : String(error); const now = new Date().toISOString();
     db.exec({ sql: 'UPDATE derived_index_jobs SET status=?,updated_at=?,error=? WHERE session_id=? AND kind=?', bind: [status, now, message, session.id, kind] });
     job = derivedFromRow(derivedJobRow(session.id, kind)!); updateDerivedSession(session.id, kind, job, status, message); sendDerivedProgress(requestId, kind, job.phase, status, job.rowsProcessed, job.totalRows, message); throw new Error(message);
-  } finally { activeDerivedSession = undefined; derivedCancelRequested = false; derivedBatchesSinceFallback = 0; }
+  } finally { if (searchIndexesDeferred) try { restoreDerivedSearchIndexes(sql => db.exec(sql)); } catch { /* a failed database remains diagnosable */ } activeDerivedSession = undefined; derivedCancelRequested = false; derivedBatchesSinceFallback = 0; }
 }
 
 function coverageFromDatabase(): ArchiveCoverage {
@@ -762,7 +857,7 @@ function diagnosticsFromDatabase() {
   const state = currentImportState(); const statsValue = stats();
   const warningGroups = rows('SELECT category,message,occurrence_count occurrenceCount,source_paths sourcePaths FROM diagnostic_warning_groups WHERE session_id=? ORDER BY occurrence_count DESC,category', [state.session?.id ?? '']).map(row => ({ category: String(row.category), message: String(row.message), count: Number(row.occurrenceCount ?? 0), sourcePaths: json<string[]>(row.sourcePaths, []) }));
   const diagnostics = statsValue.diagnostics ? { ...statsValue.diagnostics, warningGroups: warningGroups.length ? warningGroups : statsValue.diagnostics.warningGroups } : undefined;
-  return createDiagnosticsReport({ parserVersion: state.session?.parserVersion ?? FACEBOOK_PARSER_VERSION, schemaVersion: SCHEMA_VERSION, archiveParts: statsValue.archiveParts, session: state.session, coverage: coverageFromDatabase(), diagnostics, warnings: statsValue.warnings, storageMode: mode, storageFallbackReason, databaseSizeBytes: databaseSizeBytes() });
+  return createDiagnosticsReport({ parserVersion: state.session?.parserVersion ?? FACEBOOK_PARSER_VERSION, schemaVersion: SCHEMA_VERSION, archiveParts: statsValue.archiveParts, session: state.session, coverage: coverageFromDatabase(), diagnostics, warnings: statsValue.warnings, storageMode: mode, storageVfs, storageFallbackReason, databaseSizeBytes: databaseSizeBytes() });
 }
 function requestFallbackSnapshot() {
   if (mode !== 'indexeddb') return;
@@ -784,13 +879,17 @@ function requestFallbackSnapshot() {
     fallbackSnapshotRunning = true;
     void (async () => {
       try {
+        const snapshotStart = performance.now();
         const snapshot = sqliteRuntime?.capi?.sqlite3_js_db_export && db.pointer ? sqliteRuntime.capi.sqlite3_js_db_export(db.pointer) as Uint8Array : undefined;
         if (snapshot) {
+          const snapshotState = currentImportState();
           await putFallbackSnapshot(snapshot);
+          await putFallbackImportState(snapshotState);
+          importMeter.add('fallback-snapshot', performance.now() - snapshotStart, 0, snapshot.byteLength);
           const metrics = currentImportState().session?.metrics;
           if (metrics) { const next = { ...metrics, storageSnapshotBytes: snapshot.byteLength }; const state = currentImportState().session; if (state) upsertSession({ ...state, metrics: next }); }
         } else await putFallback(fallbackData);
-        await putFallbackImportState(currentImportState());
+        // Checkpoint metadata must not advance past the saved image.
       } catch { /* the in-memory query layer remains usable if browser storage is unavailable */ }
       finally {
         fallbackSnapshotRunning = false;
@@ -1017,19 +1116,31 @@ function stats(): ArchiveStats {
 }
 
 async function init() {
+  await acquireDatabaseLock();
   const sqlite3 = await sqlite3InitModule(); sqliteRuntime = sqlite3;
   let savedSnapshot: Uint8Array | undefined; let savedLegacy: NormalizedArchiveData | undefined; let savedState: ImportState | undefined;
-  if (sqlite3.oo1.OpfsDb) {
-    try { const OpfsDb = sqlite3.oo1.OpfsDb as unknown as new (filename: string, flags: string) => DB; db = new OpfsDb('/socialvault.sqlite3', 'c'); mode = 'opfs'; storageFallbackReason = undefined; }
-    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; storageFallbackReason = 'OPFS is unavailable in this browser context; using an IndexedDB snapshot fallback.'; }
-  } else { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; storageFallbackReason = 'This browser does not provide SQLite OPFS; using an IndexedDB snapshot fallback.'; }
+  const diagnostic = import.meta.env.DEV ? new URL(self.location.href).searchParams : new URLSearchParams();
+  if (diagnostic.get('benchmark') === 'memory') { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'memory'; storageVfs = 'memory'; storageFallbackReason = 'Diagnostic in-memory database (no persistence).'; }
+  else if (diagnostic.get('benchmark') === 'sahpool') { const pool = await sqlite3.installOpfsSAHPoolVfs({ name: 'socialvault-benchmark', directory: '/socialvault-benchmark' }); db = new pool.OpfsSAHPoolDb('/socialvault.sqlite3') as unknown as DB; mode = 'opfs'; storageVfs = 'opfs-sahpool'; storageFallbackReason = 'Diagnostic OPFS SAH pool.'; }
+  else if (!diagnostic.has('benchmark') && (db = await openPooledDatabase(sqlite3))) { mode = 'opfs'; storageVfs = 'opfs-sahpool'; }
+  else if (sqlite3.oo1.OpfsDb) {
+    try { const OpfsDb = sqlite3.oo1.OpfsDb as unknown as new (filename: string, flags: string) => DB; db = new OpfsDb('/socialvault.sqlite3', 'c'); mode = 'opfs'; storageVfs = 'opfs'; storageFallbackReason = undefined; }
+    catch { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; storageVfs = 'indexeddb-memory'; storageFallbackReason = 'OPFS is unavailable in this browser context; using an IndexedDB snapshot fallback.'; }
+  } else { db = new sqlite3.oo1.DB(':memory:', 'c') as unknown as DB; mode = 'indexeddb'; storageVfs = 'indexeddb-memory'; storageFallbackReason = 'This browser does not provide SQLite OPFS; using an IndexedDB snapshot fallback.'; }
   if (mode === 'indexeddb') { try { savedSnapshot = await getFallbackSnapshot(); if (!savedSnapshot) savedLegacy = await getFallback(); savedState = await getFallbackImportState(); } catch { /* in-memory SQLite remains usable when IndexedDB is unavailable or corrupt */ } }
   if (savedSnapshot && sqliteRuntime?.capi?.sqlite3_deserialize && db.pointer) {
     try { const pointer = sqliteRuntime.wasm.allocFromTypedArray(savedSnapshot); const flags = sqliteRuntime.capi.SQLITE_DESERIALIZE_RESIZEABLE | sqliteRuntime.capi.SQLITE_DESERIALIZE_FREEONCLOSE; const rc = sqliteRuntime.capi.sqlite3_deserialize(db.pointer, 'main', pointer, savedSnapshot.byteLength, savedSnapshot.byteLength, flags); if (rc !== 0) savedSnapshot = undefined; } catch { savedSnapshot = undefined; }
   }
+  db.exec('PRAGMA locking_mode=EXCLUSIVE');
+  if (diagnostic.get('journal') === 'wal') { db.exec('PRAGMA journal_mode=WAL'); db.exec('PRAGMA synchronous=FULL'); db.exec('PRAGMA wal_autocheckpoint=4096'); }
+  db.exec(`PRAGMA cache_size=-${diagnostic.has('cache') ? Number(diagnostic.get('cache')) || 2048 : 65536}`);
+  const originalExec = db.exec.bind(db);
+  db.exec = options => { const start = performance.now(); try { return originalExec(options); } finally { const sql = typeof options === 'string' ? options : String(options.sql); const table = sql.match(/(?:INTO|FROM|UPDATE)\s+(\w+)/i)?.[1] ?? 'transaction'; importMeter.add(`sql:${table}`, performance.now() - start); } };
   applyMigrations(); backfillArchiveSet(); backfillPeopleFromLegacyTables(); setupSearch();
   if (savedLegacy) { fallbackData = metadataSnapshot(savedLegacy); replace(savedLegacy); }
-  if (savedState) restoreImportState(savedState);
+  // The SQLite image contains checkpoints from exactly its snapshot boundary.
+  // Separately saved UI state may be newer and must not skip unsaved records.
+  if (savedState && !savedSnapshot) restoreImportState(savedState);
   ensureLegacyImportSession();
   // Existing pre-M10 databases may have base rows but no derived job state.
   // Rebuild only that legacy case; active import sessions are resumed through
@@ -1039,14 +1150,16 @@ async function init() {
   if (legacySession?.sourceStatus === 'complete' && legacySession.derivedStatus !== 'complete' && legacySourceRows > 0 && !rows('SELECT 1 FROM derived_index_jobs LIMIT 1').length) {
     try { rebuildSearchFromDatabase(); rebuildActivityIndex(); updateImportSession(legacySession.id, { sourceStatus: 'complete', derivedStatus: 'complete', derivedPhase: 'complete', derivedRows: Number(rows('SELECT COUNT(*) count FROM activity_records')[0]?.count ?? 0), derivedTotal: Number(rows('SELECT COUNT(*) count FROM activity_records')[0]?.count ?? 0), currentStage: 'complete', status: 'complete' }); } catch { /* old data remains browsable even if a legacy rebuild is not possible */ }
   }
-  return { mode, searchBackend, reason: storageFallbackReason, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus;
+  return { mode, searchBackend, reason: storageFallbackReason, vfs: storageVfs, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus;
 }
 
 self.onmessage = async (event: MessageEvent<DatabaseRequest>) => {
   const request = event.data;
+  const receivedAt = performance.timeOrigin + performance.now();
   try {
     if (request.type === 'init') { send({ id: request.id, ok: true, data: await init() }); return; }
-    if (request.type === 'storage-status') { send({ id: request.id, ok: true, data: { mode, searchBackend, reason: storageFallbackReason, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus }); return; }
+    if (request.type === 'source-checkpoints') { send({ id: request.id, ok: true, data: rows('SELECT source_path path FROM import_source_checkpoints WHERE session_id=? AND archive_part_id=? AND parser_version=?', [request.sessionId, request.part?.id, FACEBOOK_PARSER_VERSION]).map(row => String(row.path)) }); return; }
+    if (request.type === 'storage-status') { send({ id: request.id, ok: true, data: { mode, searchBackend, reason: storageFallbackReason, vfs: storageVfs, databaseSizeBytes: databaseSizeBytes() } satisfies StorageStatus }); return; }
     if (request.type === 'replace' && request.data) { await withStorageFallback(() => replace(request.data!)); await persistFallback(); send({ id: request.id, ok: true }); return; }
     if (request.type === 'import-state') { send({ id: request.id, ok: true, data: currentImportState(request.sessionId) }); return; }
     if (request.type === 'begin-import') { const state = await withStorageFallback(() => beginImportSession(request.session, request.data?.archiveParts ?? [], request.data?.archiveSet, request.data?.archiveIdentity)); await persistFallback(); send({ id: request.id, ok: true, data: state }); return; }

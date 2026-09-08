@@ -1,3 +1,4 @@
+import { liveImportMetrics, importMeter } from './import-metrics';
 import { mergeDetectionResults } from './detection-aggregate';
 import { archiveSourceRegistry, type ArchiveSourceDescriptor } from './source-registry';
 import type { DetectionResult } from './detectors/types';
@@ -38,6 +39,7 @@ function inspectSource(file: File, source: ArchiveSourceDescriptor, onProgress?:
     const finish = (callback: () => void) => { if (settled) return; settled = true; worker.terminate(); callback(); };
     worker.onmessage = (event: MessageEvent<ImportProgress>) => {
       const message = event.data;
+      if ((message as any).type === 'pipeline-metrics') { liveImportMetrics.parser = (message as any).metrics; return; }
       onProgress?.(message);
       if (message.type === 'manifest') {
         archiveSourceRegistry.bindPartForKey(source.key, message.part.id);
@@ -51,6 +53,7 @@ function inspectSource(file: File, source: ArchiveSourceDescriptor, onProgress?:
 }
 
 export interface ImportPartHandlers {
+  completedSourcePaths?: string[];
   onProgress?: ImportProgressHandler;
   onBatch?: (data: NormalizedArchiveData, part: ArchivePart) => Promise<void>;
   onPart?: (data: NormalizedArchiveData, part: ArchivePart) => Promise<void>;
@@ -68,12 +71,14 @@ export async function importArchivePart(part: ArchivePart, archiveSet: ArchiveSe
     const finish = (callback: () => void) => { if (settled) return; settled = true; worker.terminate(); callback(); };
     worker.onmessage = (event: MessageEvent<ImportProgress>) => {
       const message = event.data;
+      if ((message as any).type === 'pipeline-metrics') { liveImportMetrics.parser = (message as any).metrics; return; }
       handlers.onProgress?.(message);
       if (message.type === 'manifest') {
-        archiveSourceRegistry.bindPartForKey(part.id, message.part.id);
+        // The inspected fingerprint already binds this part to its runtime key.
         archiveSourceRegistry.registerManifest(part.id, message.paths);
       } else if (message.type === 'part-batch') {
-        void (handlers.onBatch ? handlers.onBatch(message.data, message.part) : Promise.resolve()).then(() => worker.postMessage({ action: 'batch-ack', ackId: message.ackId, ok: true })).catch(error => worker.postMessage({ action: 'batch-ack', ackId: message.ackId, ok: false, error: error instanceof Error ? error.message : String(error) }));
+        const ackStart = performance.now();
+        void (handlers.onBatch ? handlers.onBatch(message.data, message.part) : Promise.resolve()).then(() => { importMeter.add('batch-roundtrip', performance.now() - ackStart); liveImportMetrics.bridge = importMeter.snapshot(); worker.postMessage({ action: 'batch-ack', ackId: message.ackId, ok: true }); }).catch(error => worker.postMessage({ action: 'batch-ack', ackId: message.ackId, ok: false, error: error instanceof Error ? error.message : String(error) }));
       } else if (message.type === 'part-result') {
         void (handlers.onPart ? handlers.onPart(message.data, message.part) : Promise.resolve()).then(() => worker.postMessage({ action: 'part-ack', ackId: message.ackId, ok: true })).catch(error => worker.postMessage({ action: 'part-ack', ackId: message.ackId, ok: false, error: error instanceof Error ? error.message : String(error) }));
       } else if (message.type === 'import-result') {
@@ -83,6 +88,6 @@ export async function importArchivePart(part: ArchivePart, archiveSet: ArchiveSe
     };
     worker.onerror = () => finish(() => reject(new Error('The local import worker stopped unexpectedly.')));
     handlers.onCancelReady?.(() => worker.postMessage({ action: 'cancel', sessionId }));
-    worker.postMessage({ action: 'import-part', file, expectedParts: [part], archiveSet, sessionId });
+    worker.postMessage({ action: 'import-part', file, expectedParts: [part], archiveSet, sessionId, completedSourcePaths: handlers.completedSourcePaths });
   });
 }

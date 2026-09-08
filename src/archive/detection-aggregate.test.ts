@@ -15,4 +15,12 @@ describe('one-at-a-time detection aggregation', () => {
     expect(merged.duplicateParts).toEqual(['copy.zip']);
     expect(merged.warnings.some(warning => warning.includes('duplicate ZIP part'))).toBe(true);
   });
+
+  it('keeps a strict media-only part ready beside supported HTML', () => {
+    const structural = { supported: true, platform: 'facebook' as const, confidence: .9, entryCount: 2, inspectedEntries: 2, sections: ['Posts'], supportedSections: ['Posts'], warnings: [], format: 'html' as const, parts: [part('html', 'html', 'structural.zip')] };
+    const media = { metadataOnlyEligible: true, supported: false, platform: 'unknown' as const, confidence: .05, entryCount: 2, inspectedEntries: 2, sections: [], warnings: [], format: 'unknown' as const, parts: [part('media', 'media', 'media.zip')] };
+    const merged = mergeDetectionResults([structural, media]);
+    expect(merged.parts?.find(item => item.manifestFingerprint === 'media')?.status).toBe('ready');
+    expect(merged.unsupportedParts).toEqual([]);
+  });
 });
